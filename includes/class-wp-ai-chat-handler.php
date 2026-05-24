@@ -8,9 +8,6 @@
 
 defined( 'ABSPATH' ) || exit;
 
-use WP_Error;
-use WordPress\AI_Client\AI_Client;
-use WordPress\AI_Client\Builders\Prompt_Builder;
 use WordPress\AiClient\Messages\DTO\Message;
 use WordPress\AiClient\Messages\DTO\MessagePart;
 use WordPress\AiClient\Messages\DTO\ModelMessage;
@@ -38,8 +35,8 @@ class WP_AI_Chat_Handler {
 	 * @return array|WP_Error { response, actions?, model_info?, token_usage?, state? }
 	 */
 	public function process_prompt( string $prompt, array $attachment_ids = array(), ?array $history = null ) {
-		if ( ! class_exists( 'WordPress\AI_Client\AI_Client' ) ) {
-			return new WP_Error( 'wp_ai_client_not_available', __( 'wp-ai-client is not available.', 'wp-ai-chat' ) );
+		if ( ! function_exists( 'wp_ai_client_prompt' ) ) {
+			return new WP_Error( 'wp_ai_client_not_available', __( 'WordPress AI Client is not available (requires WordPress 7.0+).', 'wp-ai-chat' ) );
 		}
 
 		if ( ! $this->has_api_key() ) {
@@ -81,7 +78,7 @@ class WP_AI_Chat_Handler {
 		}
 
 		$initial_messages = array_merge( $existing_history, array( $original_user_message ) );
-		$builder           = AI_Client::prompt( $initial_messages );
+		$builder           = wp_ai_client_prompt( $initial_messages );
 		$builder->using_system_instruction( $system_content );
 
 		$builder->using_model_preference(
@@ -197,9 +194,11 @@ class WP_AI_Chat_Handler {
 
 	/**
 	 * Process conversation loop with function calling.
+	 *
+	 * @param object $builder WordPress core prompt builder from wp_ai_client_prompt() (WP 7.0+).
 	 */
 	private function process_conversation_loop(
-		Prompt_Builder $builder,
+		$builder,
 		UserMessage $original_user_message,
 		string $system_instruction,
 		array $function_declarations,
@@ -216,18 +215,9 @@ class WP_AI_Chat_Handler {
 		while ( $iterations < self::MAX_ITERATIONS ) {
 			++$iterations;
 
-			try {
-				$result = $builder->generate_result();
-			} catch ( \WordPress\AiClient\Providers\Http\Exception\ClientException $e ) {
-				return $this->handle_client_exception( $e );
-			} catch ( \WordPress\AiClient\Common\Exception\InvalidArgumentException $e ) {
-				if ( strpos( $e->getMessage(), 'No models found' ) !== false ) {
-					return new WP_Error(
-						'no_models_found',
-						__( 'No AI models found. Please verify your API key in Settings → AI Credentials and try again.', 'wp-ai-chat' )
-					);
-				}
-				throw $e;
+			$result = $builder->generate_result();
+			if ( is_wp_error( $result ) ) {
+				return $this->handle_generate_result_error( $result );
 			}
 
 			$candidates = $result->getCandidates();
@@ -294,7 +284,7 @@ class WP_AI_Chat_Handler {
 
 			$all_messages = array_merge( $existing_history, array( $original_user_message ) );
 			$all_messages = array_merge( $all_messages, $conversation_history );
-			$builder     = AI_Client::prompt( $all_messages );
+			$builder      = wp_ai_client_prompt( $all_messages );
 
 			if ( '' !== $system_instruction ) {
 				$builder->using_system_instruction( $system_instruction );
@@ -307,38 +297,62 @@ class WP_AI_Chat_Handler {
 		return new WP_Error( 'max_iterations', sprintf( __( 'Maximum conversation iterations (%d) reached.', 'wp-ai-chat' ), self::MAX_ITERATIONS ) );
 	}
 
-	private function handle_client_exception( \WordPress\AiClient\Providers\Http\Exception\ClientException $e ): WP_Error {
-		$message = $e->getMessage();
+	/**
+	 * Maps WP_Error from the prompt builder generate_result() to user-facing errors.
+	 *
+	 * Core wraps HTTP/SDK failures as WP_Error (e.g. prompt_client_error, prompt_invalid_argument).
+	 *
+	 * @param WP_Error $error Error from generate_result().
+	 * @return WP_Error
+	 */
+	private function handle_generate_result_error( WP_Error $error ): WP_Error {
+		$message = $error->get_error_message();
+		$code    = $error->get_error_code();
+
+		if ( 'prompt_invalid_argument' === $code && strpos( $message, 'No models found' ) !== false ) {
+			return new WP_Error(
+				'no_models_found',
+				__( 'No AI models found. Please verify your API key in Settings → AI Credentials and try again.', 'wp-ai-chat' )
+			);
+		}
+
 		$provider_name = '';
-		try {
-			$request = $e->getRequest();
-			$url     = (string) $request->getUri();
-			if ( strpos( $url, 'api.google.com' ) !== false || strpos( $url, 'generativelanguage.googleapis.com' ) !== false ) {
-				$provider_name = 'Google';
-			} elseif ( strpos( $url, 'api.openai.com' ) !== false ) {
-				$provider_name = 'OpenAI';
-			} elseif ( strpos( $url, 'api.anthropic.com' ) !== false ) {
-				$provider_name = 'Anthropic';
-			}
-		} catch ( \Exception $ex ) {
-			unset( $ex );
+		if ( strpos( $message, 'api.google.com' ) !== false || strpos( $message, 'generativelanguage.googleapis.com' ) !== false ) {
+			$provider_name = 'Google';
+		} elseif ( strpos( $message, 'api.openai.com' ) !== false ) {
+			$provider_name = 'OpenAI';
+		} elseif ( strpos( $message, 'api.anthropic.com' ) !== false ) {
+			$provider_name = 'Anthropic';
 		}
 
 		if ( strpos( $message, '429' ) !== false || strpos( $message, 'Too Many Requests' ) !== false ) {
 			$error_msg = __( 'API rate limit exceeded. You may need to upgrade your API plan or check your quota limits.', 'wp-ai-chat' );
 			if ( $provider_name ) {
-				$error_msg = sprintf( __( 'API rate limit exceeded for %s. Upgrade your API plan or check quota limits.', 'wp-ai-chat' ), $provider_name );
+				$error_msg = sprintf(
+					/* translators: %s: AI provider name (e.g. OpenAI). */
+					__( 'API rate limit exceeded for %s. Upgrade your API plan or check quota limits.', 'wp-ai-chat' ),
+					$provider_name
+				);
 			}
 			return new WP_Error( 'rate_limit', $error_msg );
 		}
+
 		if ( strpos( $message, '401' ) !== false || strpos( $message, 'Unauthorized' ) !== false ) {
 			$error_msg = __( 'Invalid API credentials. Please check your API key in Settings > AI Credentials.', 'wp-ai-chat' );
 			if ( $provider_name ) {
-				$error_msg = sprintf( __( 'Invalid API credentials for %s. Please check your API key in Settings > AI Credentials.', 'wp-ai-chat' ), $provider_name );
+				$error_msg = sprintf(
+					/* translators: %s: AI provider name (e.g. OpenAI). */
+					__( 'Invalid API credentials for %s. Please check your API key in Settings > AI Credentials.', 'wp-ai-chat' ),
+					$provider_name
+				);
 			}
 			return new WP_Error( 'invalid_credentials', $error_msg );
 		}
-		return new WP_Error( 'api_error', sprintf( __( 'API error: %s', 'wp-ai-chat' ), $message ) );
+
+		return new WP_Error(
+			$code ? $code : 'api_error',
+			sprintf( __( 'API error: %s', 'wp-ai-chat' ), $message )
+		);
 	}
 
 	private function extract_text_content( Message $message ): string {

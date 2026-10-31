@@ -1,7 +1,6 @@
 <?php
 /**
  * Generic AI handler: conversation loop with ability execution.
- * Mirrors GatherPress AI handler structure for eventual plug-in. No site-specific logic.
  *
  * @package WP_AI_Chat
  */
@@ -22,9 +21,16 @@ use WordPress\AiClient\Tools\DTO\FunctionResponse;
 class WP_AI_Chat_Handler {
 
 	const MAX_ITERATIONS = 15;
-	const MAX_PROMPTS   = 100;
-	const MAX_CHARS     = 400000;
-	const META_KEY      = 'wp_ai_chat_conversation_state';
+	const MAX_PROMPTS    = 100;
+	const MAX_CHARS      = 400000;
+	const META_KEY       = 'wp_ai_chat_conversation_state';
+
+	/**
+	 * Live progress tracker for the current request.
+	 *
+	 * @var WP_AI_Chat_Progress|null
+	 */
+	private $progress = null;
 
 	/**
 	 * Process a user prompt with AI (conversation loop + abilities).
@@ -32,9 +38,10 @@ class WP_AI_Chat_Handler {
 	 * @param string     $prompt         User's message.
 	 * @param array<int> $attachment_ids Optional. Image attachment IDs (requires image handler via filter).
 	 * @param array|null $history        Optional. Client-provided history [ [ 'role' => 'user'|'assistant', 'content' => '...' ], ... ]. If null, loads from user meta.
+	 * @param string     $progress_id    Optional. Client progress session ID for live status polling.
 	 * @return array|WP_Error { response, actions?, model_info?, token_usage?, state? }
 	 */
-	public function process_prompt( string $prompt, array $attachment_ids = array(), ?array $history = null ) {
+	public function process_prompt( string $prompt, array $attachment_ids = array(), ?array $history = null, string $progress_id = '' ) {
 		if ( ! function_exists( 'wp_ai_client_prompt' ) ) {
 			return new WP_Error( 'wp_ai_client_not_available', __( 'WordPress AI Client is not available (requires WordPress 7.0+).', 'wp-ai-chat' ) );
 		}
@@ -54,6 +61,13 @@ class WP_AI_Chat_Handler {
 		$original_user_message = new UserMessage( $message_parts );
 
 		$user_id      = get_current_user_id();
+		$progress_id  = sanitize_key( $progress_id );
+
+		if ( $user_id > 0 && '' !== $progress_id ) {
+			$this->progress = new WP_AI_Chat_Progress( $user_id, $progress_id );
+			$this->progress->start();
+		}
+
 		$use_state    = $user_id > 0 && null === $history;
 		$state        = $use_state ? $this->get_conversation_state( $user_id ) : array( 'prompt_count' => 0, 'char_count' => 0, 'history' => array() );
 		$prompt_count = $state['prompt_count'];
@@ -100,13 +114,17 @@ class WP_AI_Chat_Handler {
 			$ability_name  = $ability->get_name();
 			$function_name = 'wpab__' . str_replace( '/', '__', $ability_name );
 			$input_schema  = $ability->get_input_schema();
-			$schema_for_declaration = null;
-			if ( isset( $input_schema['type'] ) && 'object' === $input_schema['type'] ) {
-				if ( ! isset( $input_schema['properties'] ) || empty( $input_schema['properties'] ) ) {
-					$input_schema['properties'] = new \stdClass();
-				}
-				$schema_for_declaration = $input_schema;
+			$schema_for_declaration = $this->normalize_schema_for_function_calling( $input_schema );
+
+			// normalize_schema_for_function_calling() returns null both for a
+			// genuinely parameterless ability and for one whose schema couldn't
+			// be made OpenAI-safe. Only the first case is fine to send through —
+			// the second would expose a function the model can call with no way
+			// to pass required arguments, so skip it instead.
+			if ( null === $schema_for_declaration && null !== $input_schema ) {
+				continue;
 			}
+
 			$function_declarations[] = new FunctionDeclaration(
 				$function_name,
 				$ability->get_description(),
@@ -129,7 +147,14 @@ class WP_AI_Chat_Handler {
 		);
 
 		if ( is_wp_error( $result ) ) {
+			if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+				$this->progress->finish( 'error', $result->get_error_message() );
+			}
 			return $result;
+		}
+
+		if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+			$this->progress->finish( 'complete', __( 'Response ready.', 'wp-ai-chat' ) );
 		}
 
 		$response_text = $result['response'] ?? '';
@@ -155,6 +180,78 @@ class WP_AI_Chat_Handler {
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Reshape an ability's input schema into something OpenAI's function-calling
+	 * API will actually accept.
+	 *
+	 * OpenAI rejects any schema with oneOf/anyOf/allOf/enum/const/not at the top
+	 * level, even alongside a valid "type": "object" (e.g. WordPress core's
+	 * read-users and read-content abilities, which use a top-level oneOf to
+	 * express "look this up by id, OR by email, OR by username, OR list them").
+	 * Each branch of those is itself a valid object schema, so this flattens
+	 * them into one object schema with the union of every branch's properties,
+	 * dropping the per-branch "required" constraint (OpenAI's schema dialect
+	 * can't express "exactly one of these branches' required fields" anyway —
+	 * the ability's own execute/permission callback is what actually validates
+	 * a real call, so an under-specified call still fails safely there).
+	 *
+	 * @param array<string, mixed>|null $schema Ability input schema.
+	 *
+	 * @return array<string, mixed>|null Schema safe to hand to FunctionDeclaration,
+	 *                                   or null for a parameterless ability.
+	 */
+	private function normalize_schema_for_function_calling( ?array $schema ): ?array {
+		if ( null === $schema ) {
+			return null;
+		}
+
+		$union_keys = array( 'oneOf', 'anyOf' );
+		$union_key  = null;
+
+		foreach ( $union_keys as $key ) {
+			if ( isset( $schema[ $key ] ) && is_array( $schema[ $key ] ) ) {
+				$union_key = $key;
+				break;
+			}
+		}
+
+		if ( null !== $union_key ) {
+			$merged_properties = array();
+
+			foreach ( $schema[ $union_key ] as $branch ) {
+				if ( isset( $branch['properties'] ) && is_array( $branch['properties'] ) ) {
+					$merged_properties = array_merge( $merged_properties, $branch['properties'] );
+				}
+			}
+
+			$schema = array(
+				'type'                 => 'object',
+				'properties'           => $merged_properties,
+				'additionalProperties' => false,
+			);
+		}
+
+		// allOf/enum/const/not at the schema root aren't ones any current core
+		// or GatherPress ability actually uses, and there's no generically
+		// correct way to flatten them into an object schema — skip rather than
+		// send something guaranteed to 400 and take the whole batch down with it.
+		$still_disallowed = array( 'allOf', 'enum', 'const', 'not' );
+
+		if ( array_intersect_key( array_flip( $still_disallowed ), $schema ) ) {
+			return null;
+		}
+
+		if ( ! isset( $schema['type'] ) || 'object' !== $schema['type'] ) {
+			return null;
+		}
+
+		if ( empty( $schema['properties'] ) ) {
+			$schema['properties'] = new \stdClass();
+		}
+
+		return $schema;
 	}
 
 	/**
@@ -215,13 +312,32 @@ class WP_AI_Chat_Handler {
 		while ( $iterations < self::MAX_ITERATIONS ) {
 			++$iterations;
 
+			if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+				$this->progress->add_entry(
+					'iteration_start',
+					sprintf(
+						/* translators: 1: current iteration number, 2: max iterations */
+						__( 'Iteration %1$d of %2$d — waiting for model…', 'wp-ai-chat' ),
+						$iterations,
+						self::MAX_ITERATIONS
+					),
+					array( 'iteration' => $iterations )
+				);
+			}
+
 			$result = $builder->generate_result();
 			if ( is_wp_error( $result ) ) {
+				if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+					$this->progress->finish( 'error', $result->get_error_message() );
+				}
 				return $this->handle_generate_result_error( $result );
 			}
 
 			$candidates = $result->getCandidates();
 			if ( empty( $candidates ) ) {
+				if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+					$this->progress->finish( 'error', __( 'AI model returned no candidates.', 'wp-ai-chat' ) );
+				}
 				return new WP_Error( 'no_candidates', __( 'AI model returned no candidates.', 'wp-ai-chat' ) );
 			}
 
@@ -244,6 +360,15 @@ class WP_AI_Chat_Handler {
 			if ( ! $this->has_ability_calls( $message ) ) {
 				$text_content = $this->extract_text_content( $message );
 				$response_text = $text_content !== '' ? $text_content : __( 'Task completed!', 'wp-ai-chat' );
+
+				if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+					$this->progress->add_entry(
+						'model_response',
+						__( 'Model returned a final response.', 'wp-ai-chat' ),
+						array( 'iteration' => $iterations )
+					);
+				}
+
 				$estimated_cost = ( $total_prompt_tokens / 1000 * 0.01 ) + ( $total_completion_tokens / 1000 * 0.03 );
 				return array(
 					'response'    => $response_text,
@@ -263,15 +388,55 @@ class WP_AI_Chat_Handler {
 				if ( $part->getType()->isFunctionCall() ) {
 					$function_call = $part->getFunctionCall();
 					if ( $function_call instanceof FunctionCall && $this->is_ability_call( $function_call ) ) {
-						$function_response = $this->execute_ability( $function_call );
-						$function_response_messages[] = new UserMessage( array( new MessagePart( $function_response ) ) );
 						$function_name = $function_call->getName();
 						$ability_name  = $this->function_name_to_ability_name( $function_name );
-						$exec_result    = $function_response->getResponse();
-						if ( $ability_name ) {
+						$ability_args  = $function_call->getArgs();
+
+						if ( $this->progress instanceof WP_AI_Chat_Progress && $ability_name ) {
+							$this->progress->add_entry(
+								'ability_start',
+								sprintf(
+									/* translators: %s: ability name */
+									__( 'Calling ability: %s', 'wp-ai-chat' ),
+									$ability_name
+								),
+									array(
+										'iteration' => $iterations,
+										'ability'   => $ability_name,
+										'args'      => is_array( $ability_args ) ? $ability_args : array(),
+									)
+								);
+							}
+
+							$function_response = $this->execute_ability( $function_call );
+							$function_response_messages[] = new UserMessage( array( new MessagePart( $function_response ) ) );
+							$exec_result = $function_response->getResponse();
+
+							if ( $ability_name ) {
+								$debug_details = $this->extract_ability_debug_details( $exec_result );
+
+								if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+									$this->progress->add_entry(
+										'ability_done',
+										sprintf(
+											/* translators: 1: ability name, 2: result summary */
+											__( 'Finished %1$s — %2$s', 'wp-ai-chat' ),
+											$ability_name,
+											$this->summarize_ability_result( $exec_result )
+										),
+										array(
+											'iteration' => $iterations,
+											'ability'   => $ability_name,
+											'success'   => ! $this->ability_result_is_error( $exec_result ),
+											'summary'   => $this->summarize_ability_result( $exec_result ),
+											'details'   => $debug_details,
+										)
+									);
+								}
+
 							$actions_taken[] = array(
 								'ability' => $ability_name,
-								'args'    => $function_call->getArgs(),
+								'args'    => $ability_args,
 								'result'  => $exec_result,
 							);
 						}
@@ -294,7 +459,111 @@ class WP_AI_Chat_Handler {
 			}
 		}
 
-		return new WP_Error( 'max_iterations', sprintf( __( 'Maximum conversation iterations (%d) reached.', 'wp-ai-chat' ), self::MAX_ITERATIONS ) );
+		if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+			$this->progress->add_entry(
+				'max_iterations',
+				sprintf(
+					/* translators: %d: max iteration count */
+					__( 'Stopped: maximum conversation iterations (%d) reached.', 'wp-ai-chat' ),
+					self::MAX_ITERATIONS
+				),
+				array( 'iteration' => $iterations )
+			);
+			$this->progress->finish(
+				'error',
+				sprintf(
+					/* translators: %d: max iteration count */
+					__( 'Maximum conversation iterations (%d) reached.', 'wp-ai-chat' ),
+					self::MAX_ITERATIONS
+				)
+			);
+		}
+
+		return new WP_Error(
+			'max_iterations',
+			sprintf( __( 'Maximum conversation iterations (%d) reached.', 'wp-ai-chat' ), self::MAX_ITERATIONS ),
+			array(
+				'actions'   => $actions_taken,
+				'iteration' => $iterations,
+			)
+		);
+	}
+
+	/**
+	 * Whether an ability result payload represents an error.
+	 *
+	 * @param mixed $result Ability execution payload.
+	 * @return bool
+	 */
+	private function ability_result_is_error( $result ): bool {
+		if ( ! is_array( $result ) ) {
+			return true;
+		}
+
+		if ( isset( $result['error'] ) && ! empty( $result['error'] ) ) {
+			return true;
+		}
+
+		if ( array_key_exists( 'success', $result ) && false === $result['success'] ) {
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Build a short human-readable summary of an ability result for live progress.
+	 *
+	 * @param mixed $result Ability execution payload.
+	 * @return string
+	 */
+	private function summarize_ability_result( $result ): string {
+		if ( ! is_array( $result ) ) {
+			return __( 'unexpected result', 'wp-ai-chat' );
+		}
+
+		if ( isset( $result['error'] ) && is_string( $result['error'] ) && '' !== $result['error'] ) {
+			return sprintf(
+				/* translators: %s: error message */
+				__( 'error: %s', 'wp-ai-chat' ),
+				wp_html_excerpt( $result['error'], 120, '…' )
+			);
+		}
+
+		if ( isset( $result['message'] ) && is_string( $result['message'] ) && '' !== $result['message'] ) {
+			return wp_html_excerpt( $result['message'], 120, '…' );
+		}
+
+		if ( array_key_exists( 'success', $result ) ) {
+			return $result['success'] ? __( 'success', 'wp-ai-chat' ) : __( 'failed', 'wp-ai-chat' );
+		}
+
+		return __( 'done', 'wp-ai-chat' );
+	}
+
+	/**
+	 * Prepare ability result payload for live debug output.
+	 *
+	 * Returns the full result array by default. Plugins may filter
+	 * `wp_ai_chat_ability_debug_details` to trim or reshape output.
+	 *
+	 * @param mixed $result Ability execution payload.
+	 * @return array<string, mixed>
+	 */
+	private function extract_ability_debug_details( $result ): array {
+		if ( ! is_array( $result ) ) {
+			return array();
+		}
+
+		/**
+		 * Filters ability result details shown in live debug output.
+		 *
+		 * @since 1.0.8
+		 *
+		 * @param array $details Full ability result by default.
+		 * @param array $result  Raw ability result.
+		 */
+		return apply_filters( 'wp_ai_chat_ability_debug_details', $result, $result );
 	}
 
 	/**
@@ -404,7 +673,7 @@ class WP_AI_Chat_Handler {
 		}
 
 		$args   = $call->getArgs();
-		$input  = ( is_array( $args ) && ! empty( $args ) ) ? $args : null;
+		$input  = is_array( $args ) ? $args : array();
 		$result = $ability->execute( $input );
 
 		if ( is_wp_error( $result ) ) {

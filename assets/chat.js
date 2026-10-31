@@ -1,5 +1,5 @@
 /**
- * WP AI Chat – same behavior as GatherPress AI Assistant: server-side state, counter, reset.
+ * WP AI Chat admin UI: server-side state, counter, reset, and live debug stream.
  */
 ( function ( $ ) {
 	'use strict';
@@ -102,10 +102,16 @@
 			return;
 		}
 
+		const progressId = createProgressId();
+
 		addMessage( prompt, 'user' );
-		showTypingDots();
+		const $progressPanel = showLiveProgress( progressId );
 		$prompt.val( '' );
 		$submit.prop( 'disabled', true );
+
+		const pollTimer = window.setInterval( function () {
+			pollProgress( progressId );
+		}, 500 );
 
 		$.ajax( {
 			url: window.wpAiChat.ajaxUrl,
@@ -114,6 +120,7 @@
 				action: 'wp_ai_chat_send',
 				nonce: window.wpAiChat.nonce,
 				prompt: prompt,
+				progress_id: progressId,
 			},
 			success: function ( response ) {
 				if ( response.success ) {
@@ -132,41 +139,208 @@
 					}
 					addMessage( data.response, 'assistant', data.actions, data.model_info, data.token_usage );
 				} else {
-					addMessage( 'Error: ' + ( response.data && response.data.message ? response.data.message : 'Unknown error' ), 'error' );
+					const errorData = response.data || {};
+					let errorMessage = 'Error: ' + ( errorData.message ? errorData.message : 'Unknown error' );
+					if ( errorData.iteration ) {
+						errorMessage += ' (stopped after iteration ' + errorData.iteration + ')';
+					}
+					addMessage( errorMessage, 'error', errorData.actions );
 				}
 			},
 			error: function ( xhr ) {
 				let msg = 'Request failed.';
-				if ( xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message ) {
-					msg = xhr.responseJSON.data.message;
+				let actions = null;
+				if ( xhr.responseJSON && xhr.responseJSON.data ) {
+					if ( xhr.responseJSON.data.message ) {
+						msg = xhr.responseJSON.data.message;
+					}
+					if ( xhr.responseJSON.data.actions ) {
+						actions = xhr.responseJSON.data.actions;
+					}
 				} else if ( xhr.responseText ) {
 					try {
 						const parsed = JSON.parse( xhr.responseText );
 						if ( parsed.data && parsed.data.message ) {
 							msg = parsed.data.message;
 						}
+						if ( parsed.data && parsed.data.actions ) {
+							actions = parsed.data.actions;
+						}
 					} catch ( err ) {}
 				}
-				addMessage( 'Error: ' + msg, 'error' );
+				addMessage( 'Error: ' + msg, 'error', actions );
 			},
 			complete: function () {
-				removeTypingDots();
-				$submit.prop( 'disabled', false );
+				window.clearInterval( pollTimer );
+				pollProgress( progressId, function () {
+					finalizeLiveProgress( progressId );
+					$submit.prop( 'disabled', false );
+				} );
+			},
+		} );
+
+		return $progressPanel;
+	}
+
+	function createProgressId() {
+		return 'p' + Date.now().toString( 36 ) + Math.random().toString( 36 ).slice( 2, 10 );
+	}
+
+	function getLiveProgressPanel( progressId ) {
+		return $messages.find( '.wp-ai-chat-live-progress[data-progress-id="' + progressId + '"]' );
+	}
+
+	function showLiveProgress( progressId ) {
+		const $panel = $( '<div>' )
+			.addClass( 'wp-ai-chat-message wp-ai-chat-live-progress is-active' )
+			.attr( {
+				'aria-live': 'polite',
+				'data-progress-id': progressId,
+				'data-rendered-count': '0',
+			} );
+		$panel.append(
+			$( '<div>' )
+				.addClass( 'wp-ai-chat-live-progress-title' )
+				.text( 'Debug log — working…' )
+		);
+		$panel.append( $( '<ul>' ).addClass( 'wp-ai-chat-live-progress-list' ) );
+		$messages.append( $panel );
+		$messages.scrollTop( $messages[0].scrollHeight );
+		return $panel;
+	}
+
+	function finalizeLiveProgress( progressId ) {
+		const $panel = getLiveProgressPanel( progressId );
+		if ( ! $panel.length ) {
+			return;
+		}
+
+		$panel.removeClass( 'is-active' ).addClass( 'is-finished' );
+
+		const $title = $panel.find( '.wp-ai-chat-live-progress-title' );
+		if ( $title.text().indexOf( 'Stopped' ) === -1 && $title.text().indexOf( 'Finished' ) === -1 ) {
+			$title.text( 'Debug log — finished' );
+		}
+
+		if ( $panel[0] && typeof $panel[0].scrollIntoView === 'function' ) {
+			$panel[0].scrollIntoView( { behavior: 'smooth', block: 'nearest' } );
+		}
+	}
+
+	function pollProgress( progressId, onComplete ) {
+		if ( ! progressId ) {
+			if ( typeof onComplete === 'function' ) {
+				onComplete();
+			}
+			return;
+		}
+
+		$.ajax( {
+			url: window.wpAiChat.ajaxUrl,
+			type: 'POST',
+			data: {
+				action: 'wp_ai_chat_send',
+				nonce: window.wpAiChat.nonce,
+				get_progress: 'true',
+				progress_id: progressId,
+			},
+			success: function ( response ) {
+				if ( response.success && response.data && response.data.progress ) {
+					renderLiveProgress( progressId, response.data.progress );
+				}
+			},
+			complete: function () {
+				if ( typeof onComplete === 'function' ) {
+					onComplete();
+				}
 			},
 		} );
 	}
 
-	function showTypingDots() {
-		var $typing = $( '<div>' )
-			.addClass( 'wp-ai-chat-message wp-ai-chat-typing-dots-wrap' )
-			.attr( 'aria-hidden', 'true' )
-			.html( '<span class="wp-ai-chat-typing-dot"></span><span class="wp-ai-chat-typing-dot"></span><span class="wp-ai-chat-typing-dot"></span>' );
-		$messages.append( $typing );
+	function renderLiveProgress( progressId, progress ) {
+		const $panel = getLiveProgressPanel( progressId );
+		if ( ! $panel.length || ! progress || ! Array.isArray( progress.entries ) ) {
+			return;
+		}
+
+		const $list = $panel.find( '.wp-ai-chat-live-progress-list' );
+		let renderedProgressCount = parseInt( $panel.attr( 'data-rendered-count' ), 10 ) || 0;
+		const entries = progress.entries;
+
+		for ( let i = renderedProgressCount; i < entries.length; i++ ) {
+			const entry = entries[ i ];
+			const $item = $( '<li>' ).addClass( 'wp-ai-chat-live-progress-item' );
+			$item.addClass( 'wp-ai-chat-live-progress-item--' + ( entry.type || 'log' ) );
+
+			const $header = $( '<div>' ).addClass( 'wp-ai-chat-live-progress-item-header' );
+
+			if ( entry.ability ) {
+				$header.append( $( '<span>' ).addClass( 'wp-ai-chat-live-progress-ability' ).text( entry.ability ) );
+			}
+
+			$header.append( $( '<span>' ).addClass( 'wp-ai-chat-live-progress-message' ).text( entry.message || '' ) );
+			$item.append( $header );
+
+			if ( 'ability_start' === entry.type ) {
+				appendProgressPayload( $item, 'args', entry.args || {} );
+			}
+
+			if ( 'ability_done' === entry.type ) {
+				appendProgressPayload( $item, 'result', entry.details || {} );
+			}
+
+			if ( false === entry.success ) {
+				$item.addClass( 'is-error' );
+			} else if ( true === entry.success ) {
+				$item.addClass( 'is-success' );
+			}
+
+			$list.append( $item );
+		}
+
+		renderedProgressCount = entries.length;
+		$panel.attr( 'data-rendered-count', String( renderedProgressCount ) );
+
+		const $title = $panel.find( '.wp-ai-chat-live-progress-title' );
+
+		if ( progress.iteration && 'running' === progress.status ) {
+			$title.text(
+				'Debug log — iteration ' + progress.iteration + ' of ' + ( progress.max_iterations || 15 )
+			);
+		}
+
+		if ( progress.status && 'running' !== progress.status ) {
+			$title.text(
+				'error' === progress.status ? 'Debug log — stopped with error' : 'Debug log — finished'
+			);
+			$panel.removeClass( 'is-active' ).addClass( 'is-finished' );
+		}
+
 		$messages.scrollTop( $messages[0].scrollHeight );
 	}
 
-	function removeTypingDots() {
-		$messages.find( '.wp-ai-chat-typing-dots-wrap' ).remove();
+	function appendProgressPayload( $item, label, payload ) {
+		const payloadObject = payload && 'object' === typeof payload ? payload : {};
+		const payloadText = JSON.stringify( payloadObject, null, 2 );
+
+		$item.append(
+			$( '<div>' )
+				.addClass( 'wp-ai-chat-live-progress-payload-wrap' )
+				.append( $( '<span>' ).addClass( 'wp-ai-chat-live-progress-payload-label' ).text( label ) )
+				.append( $( '<pre>' ).addClass( 'wp-ai-chat-live-progress-payload' ).text( payloadText ) )
+		);
+	}
+
+	function formatActionPayload( payload ) {
+		if ( ! payload || 'object' !== typeof payload ) {
+			return '';
+		}
+
+		if ( 0 === Object.keys( payload ).length ) {
+			return '{}';
+		}
+
+		return JSON.stringify( payload, null, 2 );
 	}
 
 	function renderAbilities( abilities ) {
@@ -227,9 +401,8 @@
 				if ( response.success && response.data.state ) {
 					currentState = response.data.state;
 					updateCounter();
-					$messages.empty();
-					addMessage( 'Conversation reset. Your conversation history has been cleared and the counter has been reset.', 'success' );
-					addMessage( "Hi! I'm your AI assistant. What would you like me to help you with?", 'assistant' );
+					// Keep chat + progress logs visible while debugging; only clear server-side state.
+					addMessage( 'Conversation reset. Server history cleared and counter reset. (Debug logs kept below.)', 'success' );
 				}
 			},
 			error: function () {
@@ -270,11 +443,30 @@
 			$actionsContainer.append( '<p><strong>Actions taken:</strong></p>' );
 			actions.forEach( function ( action ) {
 				const result = action.result || {};
+				const argsText = formatActionPayload( action.args || {} );
+				const detailsText = formatActionPayload( result );
 				let actionText = '• ' + ( action.ability || 'action' );
+				if ( result.error ) {
+					actionText += ' — ' + result.error;
+				} else if ( result.message ) {
+					actionText += ' — ' + result.message;
+				}
 				if ( result.edit_url ) {
 					actionText += ' <a href="' + result.edit_url + '" class="wp-ai-chat-action-link" target="_blank">[Edit]</a>';
 				}
-				$actionsContainer.append( $( '<div>' ).addClass( 'wp-ai-chat-action' ).html( actionText ) );
+				const $action = $( '<div>' ).addClass( 'wp-ai-chat-action' );
+				$action.append( $( '<div>' ).html( actionText ) );
+				if ( argsText ) {
+					$action.append(
+						$( '<pre>' ).addClass( 'wp-ai-chat-action-payload' ).text( 'args:\n' + argsText )
+					);
+				}
+				if ( detailsText && '{}' !== detailsText ) {
+					$action.append(
+						$( '<pre>' ).addClass( 'wp-ai-chat-action-payload' ).text( 'result:\n' + detailsText )
+					);
+				}
+				$actionsContainer.append( $action );
 			} );
 			$message.append( $actionsContainer );
 		}

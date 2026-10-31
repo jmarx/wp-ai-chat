@@ -1,4 +1,4 @@
-/* Match GatherPress AI Assistant layout and styling */
+/* WP AI Chat admin page layout and styling */
 
 .wp-ai-chat-wrap {
 	max-width: 1200px;
@@ -99,7 +99,7 @@
 
 .wp-ai-chat-messages {
 	min-height: 300px;
-	max-height: 500px;
+	max-height: min( 80vh, 900px );
 	overflow-y: auto;
 	margin-bottom: 20px;
 	padding: 15px;
@@ -305,4 +305,108 @@
 	overflow: hidden;
 	position: absolute;
 	width: 1px;
+}
+
+.wp-ai-chat-live-progress {
+	background: #f6f7f7;
+	border-left: 3px solid #2271b1;
+	padding: 12px 14px;
+	font-size: 13px;
+	max-width: 100% !important;
+	width: 100%;
+	margin-right: 0;
+	margin-left: 0;
+}
+
+.wp-ai-chat-live-progress.is-finished {
+	border-left-color: #8c8f94;
+}
+
+.wp-ai-chat-live-progress-title {
+	font-weight: 600;
+	margin-bottom: 8px;
+	color: #1d2327;
+}
+
+.wp-ai-chat-live-progress-list {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	min-height: 24px;
+	max-height: none;
+	overflow-y: visible;
+}
+
+.wp-ai-chat-live-progress-item {
+	display: block;
+	padding: 8px 0;
+	border-bottom: 1px solid rgb(0 0 0 / 6%);
+	color: #50575e;
+}
+
+.wp-ai-chat-live-progress-item-header {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: baseline;
+}
+
+.wp-ai-chat-live-progress-payload-wrap {
+	margin-top: 6px;
+	width: 100%;
+}
+
+.wp-ai-chat-live-progress-payload-label {
+	display: block;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: #646970;
+	margin-bottom: 4px;
+}
+
+.wp-ai-chat-live-progress-payload,
+.wp-ai-chat-action-payload {
+	margin: 0;
+	padding: 8px 10px;
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+	font-size: 11px;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-x: auto;
+}
+
+.wp-ai-chat-live-progress-item:last-child {
+	border-bottom: none;
+}
+
+.wp-ai-chat-live-progress-ability {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+	font-size: 12px;
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 3px;
+	padding: 1px 6px;
+	color: #1d2327;
+}
+
+.wp-ai-chat-live-progress-message {
+	flex: 1 1 180px;
+}
+
+.wp-ai-chat-live-progress-item.is-error {
+	color: #b32d2e;
+}
+
+.wp-ai-chat-live-progress-item.is-success .wp-ai-chat-live-progress-message {
+	color: #1e7e34;
+}
+
+.wp-ai-chat-message--error .wp-ai-chat-actions {
+	border-top-color: rgb(179 45 46 / 20%);
 }

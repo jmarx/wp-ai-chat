@@ -68,7 +68,7 @@ class WP_AI_Chat {
 	}
 
 	/**
-	 * Render Tools > AI Chat page (same layout as GatherPress AI Assistant).
+	 * Render Tools > AI Chat page.
 	 */
 	public function render_tools_page(): void {
 		$credentials_url = admin_url( 'options-general.php?page=wp-ai-client' );
@@ -171,6 +171,21 @@ class WP_AI_Chat {
 			);
 		}
 
+		// get_progress: poll live ability progress for an in-flight request.
+		$get_progress = isset( $_POST['get_progress'] ) && 'true' === sanitize_text_field( wp_unslash( $_POST['get_progress'] ) );
+		if ( $get_progress ) {
+			$progress_id = isset( $_POST['progress_id'] ) ? sanitize_key( wp_unslash( $_POST['progress_id'] ) ) : '';
+			if ( '' === $progress_id ) {
+				wp_send_json_error( array( 'message' => __( 'Missing progress ID.', 'wp-ai-chat' ) ) );
+			}
+
+			wp_send_json_success(
+				array(
+					'progress' => WP_AI_Chat_Progress::read( get_current_user_id(), $progress_id ),
+				)
+			);
+		}
+
 		// get_state: return server-side conversation state (prompt_count, char_count, limits).
 		$get_state = isset( $_POST['get_state'] ) && 'true' === sanitize_text_field( wp_unslash( $_POST['get_state'] ) );
 		if ( $get_state ) {
@@ -189,10 +204,24 @@ class WP_AI_Chat {
 			wp_send_json_error( array( 'message' => __( 'Please enter a message.', 'wp-ai-chat' ) ) );
 		}
 
-		$result = $handler->process_prompt( $prompt, array(), null );
+		$progress_id = isset( $_POST['progress_id'] ) ? sanitize_key( wp_unslash( $_POST['progress_id'] ) ) : '';
+
+		$result = $handler->process_prompt( $prompt, array(), null, $progress_id );
 
 		if ( is_wp_error( $result ) ) {
-			wp_send_json_error( array( 'message' => $result->get_error_message() ) );
+			$error_data = $result->get_error_data();
+			$payload    = array( 'message' => $result->get_error_message() );
+
+			if ( is_array( $error_data ) ) {
+				if ( ! empty( $error_data['actions'] ) && is_array( $error_data['actions'] ) ) {
+					$payload['actions'] = $error_data['actions'];
+				}
+				if ( isset( $error_data['iteration'] ) ) {
+					$payload['iteration'] = (int) $error_data['iteration'];
+				}
+			}
+
+			wp_send_json_error( $payload );
 		}
 
 		wp_send_json_success( $result );

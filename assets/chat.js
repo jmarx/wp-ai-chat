@@ -20,7 +20,32 @@
 	const $resetButton = $( '<button>' ).addClass( 'button wp-ai-chat-reset-button' ).text( 'Reset Conversation' );
 	const $warning = $( '<div>' ).addClass( 'wp-ai-chat-warning' ).hide();
 
+	// "Show debug details": expands the JSON behind every progress/action line.
+	// Remembered per browser; storage can be unavailable, so never depend on it.
+	const DEBUG_KEY = 'wpAiChatDebug';
+	let debugOn = false;
+	try {
+		debugOn = '1' === window.localStorage.getItem( DEBUG_KEY );
+	} catch ( e ) {}
+
+	const $debugToggle = $( '<label>' )
+		.addClass( 'wp-ai-chat-debug-toggle' )
+		.append( $( '<input>' ).attr( 'type', 'checkbox' ).prop( 'checked', debugOn ) )
+		.append( document.createTextNode( ' Show debug details' ) );
+
+	$debugToggle.find( 'input' ).on( 'change', function () {
+		debugOn = this.checked;
+		try {
+			window.localStorage.setItem( DEBUG_KEY, debugOn ? '1' : '0' );
+		} catch ( e ) {}
+		$messages.find( 'details.wp-ai-chat-details' ).prop( 'open', debugOn );
+		$messages.toggleClass( 'is-debug', debugOn );
+	} );
+
+	$messages.toggleClass( 'is-debug', debugOn );
+
 	$counterContainer.append( $counter );
+	$counterContainer.append( $debugToggle );
 	$counterContainer.append( $resetButton );
 	$inputContainer.before( $warning );
 	$inputContainer.before( $counterContainer );
@@ -137,7 +162,8 @@
 							'success'
 						);
 					}
-					addMessage( data.response, 'assistant', data.actions, data.model_info, data.token_usage );
+					const $reply = addMessage( data.response, 'assistant', $progressPanel.length ? null : data.actions, data.model_info, data.token_usage );
+					embedProgress( $progressPanel, $reply );
 				} else {
 					const errorData = response.data || {};
 					let errorMessage = 'Error: ' + ( errorData.message ? errorData.message : 'Unknown error' );
@@ -201,7 +227,7 @@
 		$panel.append(
 			$( '<div>' )
 				.addClass( 'wp-ai-chat-live-progress-title' )
-				.text( 'Debug log — working…' )
+				.text( 'Working…' )
 		);
 		$panel.append( $( '<ul>' ).addClass( 'wp-ai-chat-live-progress-list' ) );
 		$messages.append( $panel );
@@ -216,15 +242,38 @@
 		}
 
 		$panel.removeClass( 'is-active' ).addClass( 'is-finished' );
+		setFinishedTitle( $panel, $panel.hasClass( 'is-error' ) ? 'error' : 'complete' );
 
+		const $card = $panel.closest( '.wp-ai-chat-message' );
+		if ( $card[0] && typeof $card[0].scrollIntoView === 'function' ) {
+			$card[0].scrollIntoView( { behavior: 'smooth', block: 'nearest' } );
+		}
+	}
+
+	/** "1 action" / "3 actions" / "No actions" / "Stopped with error". */
+	function setFinishedTitle( $panel, status ) {
 		const $title = $panel.find( '.wp-ai-chat-live-progress-title' );
-		if ( $title.text().indexOf( 'Stopped' ) === -1 && $title.text().indexOf( 'Finished' ) === -1 ) {
-			$title.text( 'Debug log — finished' );
+		if ( 'error' === status ) {
+			$panel.addClass( 'is-error' );
+			$title.text( 'Stopped with error' );
+			return;
 		}
+		const n = $panel.find( '.wp-ai-chat-live-progress-item--ability_done' ).length;
+		$title.text( n ? pluralize( n, 'action' ) : 'No actions' );
+		// Plain chat with no ability calls: nothing worth showing outside debug mode.
+		$panel.toggleClass( 'is-empty', 0 === n );
+	}
 
-		if ( $panel[0] && typeof $panel[0].scrollIntoView === 'function' ) {
-			$panel[0].scrollIntoView( { behavior: 'smooth', block: 'nearest' } );
+	/**
+	 * Move the step list into the top of the reply card, so each exchange is one
+	 * card: steps, then the reply, then the model/token footer.
+	 */
+	function embedProgress( $panel, $card ) {
+		if ( ! $panel || ! $panel.length || ! $card || ! $card.length ) {
+			return;
 		}
+		$panel.removeClass( 'wp-ai-chat-message' ).addClass( 'is-embedded' );
+		$card.prepend( $panel );
 	}
 
 	function pollProgress( progressId, onComplete ) {
@@ -268,34 +317,7 @@
 		const entries = progress.entries;
 
 		for ( let i = renderedProgressCount; i < entries.length; i++ ) {
-			const entry = entries[ i ];
-			const $item = $( '<li>' ).addClass( 'wp-ai-chat-live-progress-item' );
-			$item.addClass( 'wp-ai-chat-live-progress-item--' + ( entry.type || 'log' ) );
-
-			const $header = $( '<div>' ).addClass( 'wp-ai-chat-live-progress-item-header' );
-
-			if ( entry.ability ) {
-				$header.append( $( '<span>' ).addClass( 'wp-ai-chat-live-progress-ability' ).text( entry.ability ) );
-			}
-
-			$header.append( $( '<span>' ).addClass( 'wp-ai-chat-live-progress-message' ).text( entry.message || '' ) );
-			$item.append( $header );
-
-			if ( 'ability_start' === entry.type ) {
-				appendProgressPayload( $item, 'args', entry.args || {} );
-			}
-
-			if ( 'ability_done' === entry.type ) {
-				appendProgressPayload( $item, 'result', entry.details || {} );
-			}
-
-			if ( false === entry.success ) {
-				$item.addClass( 'is-error' );
-			} else if ( true === entry.success ) {
-				$item.addClass( 'is-success' );
-			}
-
-			$list.append( $item );
+			$list.append( buildProgressItem( entries[ i ], progress ) );
 		}
 
 		renderedProgressCount = entries.length;
@@ -304,43 +326,273 @@
 		const $title = $panel.find( '.wp-ai-chat-live-progress-title' );
 
 		if ( progress.iteration && 'running' === progress.status ) {
-			$title.text(
-				'Debug log — iteration ' + progress.iteration + ' of ' + ( progress.max_iterations || 15 )
-			);
+			$title.text( 'Working… (step ' + progress.iteration + ')' );
 		}
 
 		if ( progress.status && 'running' !== progress.status ) {
-			$title.text(
-				'error' === progress.status ? 'Debug log — stopped with error' : 'Debug log — finished'
-			);
+			setFinishedTitle( $panel, progress.status );
 			$panel.removeClass( 'is-active' ).addClass( 'is-finished' );
 		}
 
 		$messages.scrollTop( $messages[0].scrollHeight );
 	}
 
-	function appendProgressPayload( $item, label, payload ) {
-		const payloadObject = payload && 'object' === typeof payload ? payload : {};
-		const payloadText = JSON.stringify( payloadObject, null, 2 );
+	/**
+	 * One progress entry → one line. Any JSON lives behind a click on the line
+	 * (or is shown for every line when "Show debug details" is on).
+	 */
+	function buildProgressItem( entry, progress ) {
+		const type = entry.type || 'log';
+		const label = entry.label || entry.ability || '';
+		let icon = '';
+		let text = entry.message || '';
+		let payload = null;
+		let state = 'is-muted';
+		// Bookkeeping lines (start/waiting/reply-ready/end) only show in debug mode.
+		let verbose = true;
 
-		$item.append(
-			$( '<div>' )
-				.addClass( 'wp-ai-chat-live-progress-payload-wrap' )
-				.append( $( '<span>' ).addClass( 'wp-ai-chat-live-progress-payload-label' ).text( label ) )
-				.append( $( '<pre>' ).addClass( 'wp-ai-chat-live-progress-payload' ).text( payloadText ) )
-		);
+		switch ( type ) {
+			case 'iteration_start':
+				icon = '·';
+				text = 'Waiting for model (step ' + ( entry.iteration || '?' ) + ' of ' + ( progress.max_iterations || 15 ) + ')';
+				break;
+			case 'ability_start':
+				icon = '→';
+				text = label + summarizeArgs( entry.args );
+				payload = { args: entry.args || {} };
+				state = 'is-call';
+				verbose = false;
+				break;
+			case 'ability_done':
+				icon = false === entry.success ? '✗' : '✓';
+				text = label + ' · ' + summarizeResult( entry.details, entry.success, entry.summary );
+				payload = { result: undefined === entry.details ? {} : entry.details };
+				state = false === entry.success ? 'is-error' : 'is-success';
+				verbose = false;
+				break;
+			case 'model_response':
+				icon = '·';
+				text = 'Reply ready';
+				break;
+			case 'max_iterations':
+				icon = '✗';
+				state = 'is-error';
+				verbose = false;
+				break;
+			case 'request_end':
+				icon = '·';
+				if ( 'error' === progress.status ) {
+					icon = '✗';
+					state = 'is-error';
+					verbose = false;
+				}
+				break;
+			default:
+				icon = '·';
+		}
+
+		const $item = $( '<li>' )
+			.addClass( 'wp-ai-chat-live-progress-item wp-ai-chat-live-progress-item--' + type )
+			.addClass( state )
+			.toggleClass( 'is-verbose', verbose );
+
+		$item.append( buildLine( icon, text, payload, extractEditUrl( entry.details ) ) );
+		return $item;
 	}
 
-	function formatActionPayload( payload ) {
-		if ( ! payload || 'object' !== typeof payload ) {
+	/**
+	 * A single line: icon + text (+ optional Edit link). With a payload it becomes a
+	 * <details> whose summary is the line and whose body is the pretty-printed JSON.
+	 */
+	function buildLine( icon, text, payload, editUrl ) {
+		const $line = $( '<span>' ).addClass( 'wp-ai-chat-line' );
+		if ( icon ) {
+			$line.append( $( '<span>' ).addClass( 'wp-ai-chat-line-icon' ).attr( 'aria-hidden', 'true' ).text( icon ) );
+		}
+		$line.append( $( '<span>' ).addClass( 'wp-ai-chat-line-text' ).text( text ) );
+		if ( editUrl ) {
+			$line.append(
+				$( '<a>' )
+					.addClass( 'wp-ai-chat-action-link' )
+					.attr( { href: editUrl, target: '_blank', rel: 'noopener' } )
+					.text( 'Edit' )
+			);
+		}
+
+		if ( ! payload ) {
+			return $( '<div>' ).addClass( 'wp-ai-chat-line-wrap' ).append( $line );
+		}
+
+		const $details = $( '<details>' ).addClass( 'wp-ai-chat-details' ).prop( 'open', debugOn );
+		$details.append( $( '<summary>' ).append( $line ) );
+		$details.append( $( '<pre>' ).addClass( 'wp-ai-chat-payload' ).text( JSON.stringify( payload, null, 2 ) ) );
+		return $details;
+	}
+
+	/** " · doc: 1OYAp…W60g, post_type: post" — first few args, long values shortened. */
+	function summarizeArgs( args ) {
+		if ( ! args || 'object' !== typeof args ) {
 			return '';
 		}
+		const keys = Object.keys( args );
+		if ( ! keys.length ) {
+			return '';
+		}
+		const shown = keys.slice( 0, 3 ).map( function ( key ) {
+			return key + ': ' + shortValue( args[ key ] );
+		} );
+		if ( keys.length > 3 ) {
+			shown.push( '+' + ( keys.length - 3 ) + ' more' );
+		}
+		return ' · ' + shown.join( ', ' );
+	}
 
-		if ( 0 === Object.keys( payload ).length ) {
-			return '{}';
+	/** Pick the few result fields a human cares about; fall back to the server summary. */
+	function summarizeResult( result, success, fallback ) {
+		if ( false === success ) {
+			const err = result && 'object' === typeof result && result.error ? result.error : fallback;
+			return truncate( String( err || 'failed' ), 140 );
+		}
+		if ( Array.isArray( result ) ) {
+			return pluralize( result.length, 'item' );
+		}
+		if ( ! result || 'object' !== typeof result ) {
+			return fallback || 'done';
 		}
 
-		return JSON.stringify( payload, null, 2 );
+		const parts = [];
+		const title = result.title || result.title_raw || result.name;
+		if ( 'string' === typeof title && title ) {
+			parts.push( '"' + truncate( title, 50 ) + '"' );
+		}
+		if ( result.post_id ) {
+			parts.push( 'post ' + result.post_id );
+		} else if ( result.id && 'object' !== typeof result.id ) {
+			parts.push( 'id ' + result.id );
+		}
+		if ( 'string' === typeof result.status && result.status ) {
+			parts.push( result.status );
+		}
+		Object.keys( result ).forEach( function ( key ) {
+			if ( Array.isArray( result[ key ] ) && 'warnings' !== key && parts.length < 4 ) {
+				parts.push( pluralize( result[ key ].length, key.replace( /_/g, ' ' ).replace( /s$/, '' ) ) );
+			}
+		} );
+		[ 'total', 'count', 'replaced', 'block_count' ].forEach( function ( key ) {
+			if ( 'number' === typeof result[ key ] && parts.length < 4 ) {
+				parts.push( key.replace( /_/g, ' ' ) + ' ' + result[ key ] );
+			}
+		} );
+		if ( Array.isArray( result.warnings ) && result.warnings.length ) {
+			parts.push( pluralize( result.warnings.length, 'warning' ) );
+		}
+		if ( ! parts.length && 'string' === typeof result.message && result.message ) {
+			parts.push( truncate( result.message, 100 ) );
+		}
+
+		return parts.length ? parts.slice( 0, 5 ).join( ' · ' ) : ( fallback || 'done' );
+	}
+
+	function shortValue( value ) {
+		if ( null === value || undefined === value ) {
+			return String( value );
+		}
+		if ( Array.isArray( value ) ) {
+			return '[' + value.length + ']';
+		}
+		if ( 'object' === typeof value ) {
+			return '{…}';
+		}
+		// Keep it on one line: post HTML etc. arrives multi-line.
+		const str = String( value ).replace( /\s+/g, ' ' ).trim();
+		// Long token-like values (IDs, URLs): keep both ends.
+		if ( str.length > 24 && ! /\s/.test( str ) ) {
+			return str.slice( 0, 6 ) + '…' + str.slice( -4 );
+		}
+		return /\s/.test( str ) ? '"' + truncate( str, 40 ) + '"' : truncate( str, 40 );
+	}
+
+	function truncate( str, max ) {
+		return str.length > max ? str.slice( 0, max - 1 ) + '…' : str;
+	}
+
+	function pluralize( n, noun ) {
+		return n + ' ' + noun + ( 1 === n ? '' : 's' );
+	}
+
+	function escapeHtml( str ) {
+		return String( str )
+			.replace( /&/g, '&amp;' )
+			.replace( /</g, '&lt;' )
+			.replace( />/g, '&gt;' )
+			.replace( /"/g, '&quot;' )
+			.replace( /'/g, '&#39;' );
+	}
+
+	/**
+	 * Minimal, safe Markdown → HTML for model replies: paragraphs, line breaks,
+	 * bullet/numbered lists, **bold**, *italic*, `code`, [links](url) and bare URLs.
+	 * Everything is HTML-escaped first; only http(s) links become <a>.
+	 */
+	function renderMarkdown( text ) {
+		const blocks = escapeHtml( text || '' ).replace( /\r\n/g, '\n' ).trim().split( /\n{2,}/ );
+
+		return blocks.map( function ( block ) {
+			const lines = block.split( '\n' );
+			if ( lines.every( function ( l ) { return /^\s*[-*•]\s+/.test( l ); } ) ) {
+				return '<ul>' + lines.map( function ( l ) {
+					return '<li>' + renderInline( l.replace( /^\s*[-*•]\s+/, '' ) ) + '</li>';
+				} ).join( '' ) + '</ul>';
+			}
+			if ( lines.every( function ( l ) { return /^\s*\d+[.)]\s+/.test( l ); } ) ) {
+				return '<ol>' + lines.map( function ( l ) {
+					return '<li>' + renderInline( l.replace( /^\s*\d+[.)]\s+/, '' ) ) + '</li>';
+				} ).join( '' ) + '</ol>';
+			}
+			const heading = block.match( /^(#{1,4})\s+(.+)$/ );
+			if ( heading && 1 === lines.length ) {
+				return '<p class="wp-ai-chat-md-heading">' + renderInline( heading[2] ) + '</p>';
+			}
+			return '<p>' + lines.map( renderInline ).join( '<br>' ) + '</p>';
+		} ).join( '' );
+	}
+
+	/** Inline Markdown on already-escaped text. */
+	function renderInline( str ) {
+		const links = [];
+		const stash = function ( html ) {
+			links.push( html );
+			return '\u0000' + ( links.length - 1 ) + '\u0000';
+		};
+		const anchor = function ( url, label ) {
+			return '<a href="' + url + '" target="_blank" rel="noopener">' + label + '</a>';
+		};
+
+		// Inline code first so its contents aren't formatted.
+		str = str.replace( /`([^`]+)`/g, function ( m, code ) {
+			return stash( '<code>' + code + '</code>' );
+		} );
+		// [label](https://…)
+		str = str.replace( /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function ( m, label, url ) {
+			return stash( anchor( url, label ) );
+		} );
+		// Bare URLs (trailing punctuation stays outside the link).
+		str = str.replace( /\bhttps?:\/\/[^\s<]+[^\s<.,;:!?)\]'"]/g, function ( url ) {
+			return stash( anchor( url, url ) );
+		} );
+
+		str = str
+			.replace( /\*\*([^*]+)\*\*/g, '<strong>$1</strong>' )
+			.replace( /(^|[^*\w])\*([^*\s][^*]*)\*(?=[^*\w]|$)/g, '$1<em>$2</em>' );
+
+		return str.replace( /\u0000(\d+)\u0000/g, function ( m, i ) {
+			return links[ Number( i ) ];
+		} );
+	}
+
+	function extractEditUrl( result ) {
+		const url = result && 'object' === typeof result ? result.edit_url : null;
+		return 'string' === typeof url && /^https?:\/\//.test( url ) ? url : null;
 	}
 
 	function renderAbilities( abilities ) {
@@ -402,7 +654,7 @@
 					currentState = response.data.state;
 					updateCounter();
 					// Keep chat + progress logs visible while debugging; only clear server-side state.
-					addMessage( 'Conversation reset. Server history cleared and counter reset. (Debug logs kept below.)', 'success' );
+					addMessage( 'Conversation reset. Server history cleared and counter reset.', 'success' );
 				}
 			},
 			error: function () {
@@ -418,61 +670,53 @@
 		type = type || 'assistant';
 		const $message = $( '<div>' ).addClass( 'wp-ai-chat-message wp-ai-chat-message--' + type );
 
-		if ( modelInfo && type === 'assistant' ) {
-			const $modelInfo = $( '<div>' ).addClass( 'wp-ai-chat-model-info' ).text( 'Using ' + modelInfo.provider + ' ' + modelInfo.model );
-			$message.append( $modelInfo );
+		const $content = $( '<div>' ).addClass( 'wp-ai-chat-message-content' );
+		if ( 'assistant' === type ) {
+			// Model replies are Markdown: render links, bold, lists. Escaped first, so safe.
+			$content.addClass( 'is-rich' ).html( renderMarkdown( content ) );
+		} else {
+			$content.text( content );
 		}
-		if ( tokenUsage && type === 'assistant' ) {
-			let costText = '';
-			if ( tokenUsage.estimated_cost != null ) {
-				costText = ' (~$' + Number( tokenUsage.estimated_cost ).toFixed( 4 ) + ')';
-			}
-			const $tokenInfo = $( '<div>' ).addClass( 'wp-ai-chat-token-info' ).text(
-				'Tokens: ' + ( tokenUsage.prompt_tokens || 0 ).toLocaleString() + ' prompt, ' +
-				( tokenUsage.completion_tokens || 0 ).toLocaleString() + ' completion, ' +
-				( tokenUsage.total_tokens || 0 ).toLocaleString() + ' total' + costText
-			);
-			$message.append( $tokenInfo );
-		}
-
-		const $content = $( '<div>' ).addClass( 'wp-ai-chat-message-content' ).text( content );
 		$message.append( $content );
 
 		if ( actions && actions.length > 0 ) {
 			const $actionsContainer = $( '<div>' ).addClass( 'wp-ai-chat-actions' );
-			$actionsContainer.append( '<p><strong>Actions taken:</strong></p>' );
+			$actionsContainer.append( $( '<p>' ).addClass( 'wp-ai-chat-actions-title' ).text( 'Actions taken' ) );
 			actions.forEach( function ( action ) {
-				const result = action.result || {};
-				const argsText = formatActionPayload( action.args || {} );
-				const detailsText = formatActionPayload( result );
-				let actionText = '• ' + ( action.ability || 'action' );
-				if ( result.error ) {
-					actionText += ' — ' + result.error;
-				} else if ( result.message ) {
-					actionText += ' — ' + result.message;
-				}
-				if ( result.edit_url ) {
-					actionText += ' <a href="' + result.edit_url + '" class="wp-ai-chat-action-link" target="_blank">[Edit]</a>';
-				}
-				const $action = $( '<div>' ).addClass( 'wp-ai-chat-action' );
-				$action.append( $( '<div>' ).html( actionText ) );
-				if ( argsText ) {
-					$action.append(
-						$( '<pre>' ).addClass( 'wp-ai-chat-action-payload' ).text( 'args:\n' + argsText )
-					);
-				}
-				if ( detailsText && '{}' !== detailsText ) {
-					$action.append(
-						$( '<pre>' ).addClass( 'wp-ai-chat-action-payload' ).text( 'result:\n' + detailsText )
-					);
-				}
-				$actionsContainer.append( $action );
+				const result = action.result;
+				const failed = ! result || 'object' !== typeof result || !! result.error || false === result.success;
+				const label = action.label || action.ability || 'action';
+				// Built with .text()/attr, never .html(): ability output is untrusted.
+				const $line = buildLine(
+					failed ? '✗' : '✓',
+					label + ' · ' + summarizeResult( result, ! failed, '' ),
+					{ args: action.args || {}, result: undefined === result ? {} : result },
+					extractEditUrl( result )
+				);
+				$actionsContainer.append( $( '<div>' ).addClass( 'wp-ai-chat-action' ).toggleClass( 'is-error', failed ).append( $line ) );
 			} );
 			$message.append( $actionsContainer );
 		}
 
+		// One quiet footer line: "OpenAI gpt-4o-mini · 10,818 tokens (10,683 in / 135 out)".
+		if ( 'assistant' === type && ( modelInfo || tokenUsage ) ) {
+			const meta = [];
+			if ( modelInfo ) {
+				meta.push( modelInfo.provider + ' ' + modelInfo.model );
+			}
+			if ( tokenUsage ) {
+				meta.push(
+					( tokenUsage.total_tokens || 0 ).toLocaleString() + ' tokens (' +
+					( tokenUsage.prompt_tokens || 0 ).toLocaleString() + ' in / ' +
+					( tokenUsage.completion_tokens || 0 ).toLocaleString() + ' out)'
+				);
+			}
+			$message.append( $( '<div>' ).addClass( 'wp-ai-chat-meta' ).text( meta.join( ' · ' ) ) );
+		}
+
 		$messages.append( $message );
 		$messages.scrollTop( $messages[0].scrollHeight );
+		return $message;
 	}
 
 	if ( $messages.children().length === 0 ) {

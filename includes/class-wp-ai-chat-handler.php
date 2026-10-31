@@ -403,6 +403,7 @@ class WP_AI_Chat_Handler {
 									array(
 										'iteration' => $iterations,
 										'ability'   => $ability_name,
+										'label'     => $this->get_ability_label( $ability_name ),
 										'args'      => is_array( $ability_args ) ? $ability_args : array(),
 									)
 								);
@@ -427,6 +428,7 @@ class WP_AI_Chat_Handler {
 										array(
 											'iteration' => $iterations,
 											'ability'   => $ability_name,
+											'label'     => $this->get_ability_label( $ability_name ),
 											'success'   => ! $this->ability_result_is_error( $exec_result ),
 											'summary'   => $this->summarize_ability_result( $exec_result ),
 											'details'   => $debug_details,
@@ -436,6 +438,7 @@ class WP_AI_Chat_Handler {
 
 							$actions_taken[] = array(
 								'ability' => $ability_name,
+								'label'   => $this->get_ability_label( $ability_name ),
 								'args'    => $ability_args,
 								'result'  => $exec_result,
 							);
@@ -487,6 +490,19 @@ class WP_AI_Chat_Handler {
 				'iteration' => $iterations,
 			)
 		);
+	}
+
+	/**
+	 * Human-readable ability label for the chat UI (e.g. "Import Google Doc"),
+	 * falling back to the ability name.
+	 *
+	 * @param string $ability_name Ability name.
+	 * @return string
+	 */
+	private function get_ability_label( string $ability_name ): string {
+		$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $ability_name ) : null;
+		$label   = $ability ? (string) $ability->get_label() : '';
+		return '' !== $label ? $label : $ability_name;
 	}
 
 	/**

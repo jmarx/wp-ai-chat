@@ -96,17 +96,18 @@ class WP_AI_Chat {
 		<div class="wrap wp-ai-chat-wrap">
 			<h1><?php esc_html_e( 'AI Chat', 'wp-ai-chat' ); ?></h1>
 			<div class="wp-ai-chat-container">
-				<div class="wp-ai-chat-intro">
-					<h2><?php esc_html_e( 'Chat with your chosen model', 'wp-ai-chat' ); ?></h2>
-					<p><?php esc_html_e( 'Ask anything in plain language. Add abilities via the wp_ai_chat_abilities filter to give the assistant tools.', 'wp-ai-chat' ); ?></p>
-					<div class="wp-ai-chat-examples">
-						<p><strong><?php esc_html_e( 'Example prompts:', 'wp-ai-chat' ); ?></strong></p>
-						<ul>
-							<li><?php esc_html_e( 'Summarize the key points of…', 'wp-ai-chat' ); ?></li>
-							<li><?php esc_html_e( 'Draft a short reply to…', 'wp-ai-chat' ); ?></li>
-							<li><?php esc_html_e( 'Explain this in simpler terms…', 'wp-ai-chat' ); ?></li>
-						</ul>
-					</div>
+				<div class="wp-ai-chat" id="wp-ai-chat">
+					<div class="wp-ai-chat-messages" role="log" aria-live="polite"></div>
+					<form class="wp-ai-chat-form" method="post" action="">
+						<div class="wp-ai-chat-input-container">
+							<label for="wp-ai-chat-input" class="screen-reader-text"><?php esc_html_e( 'Your message', 'wp-ai-chat' ); ?></label>
+							<textarea id="wp-ai-chat-input" class="wp-ai-chat-input" name="message" rows="3" placeholder="<?php esc_attr_e( 'What would you like me to do?', 'wp-ai-chat' ); ?>" required></textarea>
+							<button type="submit" class="wp-ai-chat-submit button button-primary button-large"><?php esc_html_e( 'Send', 'wp-ai-chat' ); ?></button>
+						</div>
+					</form>
+					<div class="wp-ai-chat-status" aria-hidden="true"></div>
+				</div>
+				<div class="wp-ai-chat-abilities">
 					<div class="wp-ai-chat-abilities-toggle">
 						<span class="wp-ai-chat-abilities-toggle-icon" aria-hidden="true">&#9654;</span>
 						<button type="button" class="wp-ai-chat-abilities-toggle-button">
@@ -119,17 +120,6 @@ class WP_AI_Chat {
 						</p>
 						<ul class="wp-ai-chat-abilities-list" aria-live="polite" aria-busy="false"></ul>
 					</div>
-				</div>
-				<div class="wp-ai-chat" id="wp-ai-chat">
-					<div class="wp-ai-chat-messages" role="log" aria-live="polite"></div>
-					<form class="wp-ai-chat-form" method="post" action="">
-						<div class="wp-ai-chat-input-container">
-							<label for="wp-ai-chat-input" class="screen-reader-text"><?php esc_html_e( 'Your message', 'wp-ai-chat' ); ?></label>
-							<textarea id="wp-ai-chat-input" class="wp-ai-chat-input" name="message" rows="3" placeholder="<?php esc_attr_e( 'What would you like me to do?', 'wp-ai-chat' ); ?>" required></textarea>
-							<button type="submit" class="wp-ai-chat-submit button button-primary button-large"><?php esc_html_e( 'Send', 'wp-ai-chat' ); ?></button>
-						</div>
-					</form>
-					<div class="wp-ai-chat-status" aria-hidden="true"></div>
 				</div>
 			</div>
 		</div>
@@ -169,6 +159,41 @@ class WP_AI_Chat {
 					'abilities' => $handler->get_registered_abilities(),
 				)
 			);
+		}
+
+		// models: available models (from configured providers) + this user's / the site's choice.
+		if ( isset( $_POST['models'] ) && 'true' === sanitize_text_field( wp_unslash( $_POST['models'] ) ) ) {
+			wp_send_json_success(
+				array(
+					'groups'       => WP_AI_Chat_Models::available(),
+					'user_choice'  => WP_AI_Chat_Models::user_choice( get_current_user_id() ),
+					'site_default' => (string) get_option( WP_AI_Chat_Models::OPTION_DEFAULT, '' ),
+				)
+			);
+		}
+
+		// set_model: save this user's model ('' = use the site default).
+		if ( isset( $_POST['set_model'] ) && 'true' === sanitize_text_field( wp_unslash( $_POST['set_model'] ) ) ) {
+			$choice = isset( $_POST['model'] ) ? sanitize_text_field( wp_unslash( $_POST['model'] ) ) : '';
+			if ( ! WP_AI_Chat_Models::set_user_choice( get_current_user_id(), $choice ) ) {
+				wp_send_json_error( array( 'message' => __( 'That model is not available.', 'wp-ai-chat' ) ) );
+			}
+			wp_send_json_success( array( 'model' => $choice ) );
+		}
+
+		// confirm_action: the user clicked Confirm/Cancel on a destructive ability call.
+		$confirm_action = isset( $_POST['confirm_action'] ) && 'true' === sanitize_text_field( wp_unslash( $_POST['confirm_action'] ) );
+		if ( $confirm_action ) {
+			$token     = isset( $_POST['token'] ) ? sanitize_key( wp_unslash( $_POST['token'] ) ) : '';
+			$decision = isset( $_POST['decision'] ) ? sanitize_key( wp_unslash( $_POST['decision'] ) ) : 'cancel';
+			$outcome  = '' === $token
+				? new WP_Error( 'missing_token', __( 'Missing confirmation token.', 'wp-ai-chat' ) )
+				: $handler->resolve_confirmation( $token, $decision );
+
+			if ( is_wp_error( $outcome ) ) {
+				wp_send_json_error( array( 'message' => $outcome->get_error_message() ) );
+			}
+			wp_send_json_success( $outcome );
 		}
 
 		// get_progress: poll live ability progress for an in-flight request.

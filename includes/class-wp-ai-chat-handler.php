@@ -25,6 +25,23 @@ class WP_AI_Chat_Handler {
 	const MAX_CHARS      = 400000;
 	const META_KEY       = 'wp_ai_chat_conversation_state';
 
+	/** How long a pending [Confirm] button stays valid. */
+	const CONFIRM_TTL = 30 * MINUTE_IN_SECONDS;
+
+	/**
+	 * Destructive ability calls held back for the user to confirm in this request.
+	 *
+	 * @var array<int, array<string, mixed>>
+	 */
+	private $pending_confirmations = array();
+
+	/**
+	 * Revision copies created or changed during this request (copy ID => true).
+	 *
+	 * @var array<int, bool>
+	 */
+	private $touched_revisions = array();
+
 	/**
 	 * Live progress tracker for the current request.
 	 *
@@ -95,15 +112,12 @@ class WP_AI_Chat_Handler {
 		$builder           = wp_ai_client_prompt( $initial_messages );
 		$builder->using_system_instruction( $system_content );
 
-		$builder->using_model_preference(
-			array( 'openai', 'gpt-4o-mini' ),
-			array( 'openai', 'gpt-4o' ),
-			array( 'openai', 'gpt-4.1-mini' ),
-			array( 'openai', 'gpt-4.1' ),
-			array( 'google', 'gemini-2.0-flash' ),
-			array( 'google', 'gemini-2.5-flash' ),
-			array( 'anthropic', 'claude-haiku-4-5' )
-		);
+		// The user's model, else the site default (Settings → AI Chat). No choice at all:
+		// the AI client picks from whatever providers are configured.
+		$model_choice = WP_AI_Chat_Models::resolve( $user_id );
+		if ( $model_choice ) {
+			$builder->using_model_preference( $model_choice );
+		}
 
 		$function_declarations = array();
 		foreach ( $abilities as $ability_name ) {
@@ -371,7 +385,9 @@ class WP_AI_Chat_Handler {
 
 				$estimated_cost = ( $total_prompt_tokens / 1000 * 0.01 ) + ( $total_completion_tokens / 1000 * 0.03 );
 				return array(
-					'response'    => $response_text,
+					'response'      => $response_text,
+					'confirmations' => $this->pending_confirmations,
+					'revisions'     => $this->build_revision_cards(),
 					'actions'     => $actions_taken,
 					'model_info'  => $model_info,
 					'token_usage' => array(
@@ -412,6 +428,7 @@ class WP_AI_Chat_Handler {
 							$function_response = $this->execute_ability( $function_call );
 							$function_response_messages[] = new UserMessage( array( new MessagePart( $function_response ) ) );
 							$exec_result = $function_response->getResponse();
+							$this->note_revision_touch( is_array( $ability_args ) ? $ability_args : array(), $exec_result );
 
 							if ( $ability_name ) {
 								$debug_details = $this->extract_ability_debug_details( $exec_result );
@@ -490,6 +507,324 @@ class WP_AI_Chat_Handler {
 				'iteration' => $iterations,
 			)
 		);
+	}
+
+	/**
+	 * Whether an ability is annotated as destructive (meta.annotations.destructive).
+	 */
+	public static function is_destructive( \WP_Ability $ability ): bool {
+		$annotations = $ability->get_meta_item( 'annotations', array() );
+		return is_array( $annotations ) && ! empty( $annotations['destructive'] );
+	}
+
+	/**
+	 * A destructive ability may skip confirmation only when it edits a post that is
+	 * not live (draft, pending, revision copy). Deleting, discarding and publishing
+	 * always need a click, whatever the target.
+	 *
+	 * @param \WP_Ability          $ability Ability.
+	 * @param array<string, mixed> $input   Arguments.
+	 */
+	private static function is_unconfirmed_edit_allowed( \WP_Ability $ability, array $input ): bool {
+		if ( preg_match( '/delete|discard|publish|trash/i', $ability->get_name() ) ) {
+			return false;
+		}
+
+		$target_id = (int) ( $input['id'] ?? $input['post_id'] ?? 0 );
+		$target    = $target_id ? get_post( $target_id ) : null;
+		if ( ! $target ) {
+			return false;
+		}
+
+		$not_live = ! in_array( $target->post_status, array( 'publish', 'future', 'private' ), true );
+
+		/**
+		 * Filters whether a destructive ability call may run without a Confirm click.
+		 *
+		 * @param bool        $not_live Default: true when the target post is not live.
+		 * @param \WP_Ability $ability  Ability.
+		 * @param array       $input    Arguments.
+		 * @param \WP_Post    $target   Target post.
+		 */
+		return (bool) apply_filters( 'wp_ai_chat_skip_confirmation', $not_live, $ability, $input, $target );
+	}
+
+	/**
+	 * Park a destructive call until the user clicks Confirm or Cancel in the chat.
+	 * Returns what the model sees instead of the real result.
+	 *
+	 * @param \WP_Ability          $ability Ability.
+	 * @param array<string, mixed> $input   Arguments the model supplied.
+	 * @return array<string, mixed>
+	 */
+	private function hold_for_confirmation( \WP_Ability $ability, array $input ): array {
+		$user_id = get_current_user_id();
+		$token   = strtolower( wp_generate_password( 24, false ) );
+		$label   = $this->get_ability_label( $ability->get_name() );
+
+		// Editing a live post: offer to do it on a revision copy (preview first) instead.
+		$target = self::live_edit_target( $ability, $input );
+		$mode   = $target ? 'revision_choice' : 'confirm';
+
+		// Publishing a revision: talk about the live page it replaces, never the temporary copy.
+		$publish_target = null;
+		if ( ! $target && 'content-revisions/publish-revision' === $ability->get_name() && class_exists( 'Content_Revisions_Store' ) ) {
+			$publish_target = Content_Revisions_Store::get_original( (int) ( $input['copy_id'] ?? 0 ) );
+			if ( $publish_target ) {
+				$mode = 'publish_revision';
+			}
+		}
+
+		set_transient(
+			self::confirmation_key( $user_id, $token ),
+			array(
+				'ability'   => $ability->get_name(),
+				'label'     => $label,
+				'input'     => $input,
+				'mode'      => $mode,
+				'target_id' => $target ? $target->ID : 0,
+			),
+			self::CONFIRM_TTL
+		);
+
+		$this->pending_confirmations[] = array(
+			'token'        => $token,
+			'ability'      => $ability->get_name(),
+			'label'        => $label,
+			'args'         => $input,
+			'mode'         => $mode,
+			'target_title' => $target ? $target->post_title : ( $publish_target ? $publish_target->post_title : '' ),
+		);
+
+		$message = $publish_target
+			? sprintf( 'NOT DONE YET. A Publish button is now shown to the user in the chat; clicking it replaces the live "%s" with the revision. Briefly tell them to click Publish (or Cancel). Refer to the page by its title only, never by the copy ID. Do not call this ability again and do not say it is done.', $publish_target->post_title )
+			: ( $target
+			? sprintf( 'NOT DONE YET. "%s" is live, so the user is now being asked in the chat whether to make this change on a revision copy (preview first) or directly on the live page. Nothing happens until they choose. Briefly tell them to pick an option. Do not call this ability again and do not say it is done.', $target->post_title )
+			: sprintf( 'NOT DONE YET. "%s" changes the live site, so a Confirm button is now shown to the user in the chat. It runs only if they click it. Tell the user to click Confirm (or Cancel). Do not call this ability again and do not say it is done.', $label ) );
+
+		return array(
+			'status'          => 'awaiting_confirmation',
+			'confirmation_id' => $token,
+			'message'         => $message,
+		);
+	}
+
+	/**
+	 * Remember revision copies an ability call created or changed.
+	 *
+	 * @param array<string, mixed> $args   Ability arguments.
+	 * @param mixed                $result Ability result.
+	 */
+	private function note_revision_touch( array $args, $result ): void {
+		if ( ! class_exists( 'Content_Revisions_Store' ) || ( is_array( $result ) && ( ! empty( $result['error'] ) || ( $result['status'] ?? '' ) === 'awaiting_confirmation' ) ) ) {
+			return;
+		}
+		$ids = array( $args['id'] ?? 0, $args['post_id'] ?? 0, $args['copy_id'] ?? 0 );
+		if ( is_array( $result ) ) {
+			$ids[] = $result['copy_id'] ?? 0;
+			$ids[] = $result['post_id'] ?? 0;
+		}
+		foreach ( $ids as $id ) {
+			$id = (int) $id;
+			if ( $id && Content_Revisions_Store::is_copy( $id ) ) {
+				$this->touched_revisions[ $id ] = true;
+			}
+		}
+	}
+
+	/**
+	 * A "what next" card for each revision touched in this request: preview link plus
+	 * a Publish button (its own confirmation token). Skipped when a publish for that
+	 * copy is already waiting for a click in this reply.
+	 *
+	 * @return array<int, array<string, mixed>>
+	 */
+	private function build_revision_cards(): array {
+		if ( ! class_exists( 'Content_Revisions_Store' ) || ! function_exists( 'wp_get_ability' ) ) {
+			return array();
+		}
+		$publish = wp_get_ability( 'content-revisions/publish-revision' );
+		if ( ! $publish instanceof \WP_Ability ) {
+			return array();
+		}
+
+		$already_pending = array();
+		foreach ( $this->pending_confirmations as $pending ) {
+			if ( 'content-revisions/publish-revision' === $pending['ability'] ) {
+				$already_pending[ (int) ( $pending['args']['copy_id'] ?? 0 ) ] = true;
+			}
+		}
+
+		$cards   = array();
+		$user_id = get_current_user_id();
+		foreach ( array_keys( $this->touched_revisions ) as $copy_id ) {
+			$copy = get_post( $copy_id );
+			if ( ! $copy || isset( $already_pending[ $copy_id ] ) || ! Content_Revisions_Store::is_copy( $copy ) ) {
+				continue;
+			}
+			$original = Content_Revisions_Store::get_original( $copy );
+			if ( ! $original ) {
+				continue;
+			}
+
+			$token = strtolower( wp_generate_password( 24, false ) );
+			set_transient(
+				self::confirmation_key( $user_id, $token ),
+				array(
+					'ability'   => $publish->get_name(),
+					'label'     => $this->get_ability_label( $publish->get_name() ),
+					'input'     => array( 'copy_id' => $copy_id ),
+					'mode'      => 'publish_revision',
+					'target_id' => $original->ID,
+				),
+				self::CONFIRM_TTL
+			);
+
+			$info    = Content_Revisions_Store::describe( $copy, $original );
+			$cards[] = array(
+				'token'        => $token,
+				'mode'         => 'publish_revision',
+				'label'        => $this->get_ability_label( $publish->get_name() ),
+				'target_title' => $original->post_title,
+				'preview_url'  => $info['preview_url'],
+				'live_url'     => $info['live_url'],
+			);
+		}
+		return $cards;
+	}
+
+	/**
+	 * The live post an edit ability targets, when a revision copy could be used instead.
+	 * Null for deletes/publishes, non-post targets, or when content-revisions isn't active.
+	 */
+	private static function live_edit_target( \WP_Ability $ability, array $input ): ?\WP_Post {
+		if ( ! class_exists( 'Content_Revisions_Store' ) || preg_match( '/delete|discard|publish|trash|revision/i', $ability->get_name() ) ) {
+			return null;
+		}
+		$key    = self::target_key( $input );
+		$target = $key ? get_post( (int) $input[ $key ] ) : null;
+		return ( $target && 'publish' === $target->post_status ) ? $target : null;
+	}
+
+	/** Which input key holds the target post ID ('id' or 'post_id'), if any. */
+	private static function target_key( array $input ): ?string {
+		foreach ( array( 'id', 'post_id' ) as $key ) {
+			if ( ! empty( $input[ $key ] ) && is_numeric( $input[ $key ] ) ) {
+				return $key;
+			}
+		}
+		return null;
+	}
+
+	private static function confirmation_key( int $user_id, string $token ): string {
+		return 'wp_ai_chat_confirm_' . $user_id . '_' . $token;
+	}
+
+	/**
+	 * Resolve a parked destructive call after the user's click:
+	 * 'confirm' runs it as asked, 'revision' runs it on a revision copy of the
+	 * live post instead, 'cancel' does nothing. The outcome is added to the
+	 * conversation history so the model knows what happened.
+	 *
+	 * @return array<string, mixed>|WP_Error
+	 */
+	public function resolve_confirmation( string $token, string $decision ) {
+		$user_id = get_current_user_id();
+		$key     = self::confirmation_key( $user_id, $token );
+		$pending = get_transient( $key );
+		delete_transient( $key ); // One click only.
+
+		if ( ! is_array( $pending ) || empty( $pending['ability'] ) ) {
+			return new WP_Error( 'wp_ai_chat_confirm_expired', __( 'This action expired or was already handled. Ask again if you still want it.', 'wp-ai-chat' ) );
+		}
+
+		$label = (string) $pending['label'];
+
+		if ( 'confirm' !== $decision && 'revision' !== $decision ) {
+			$this->append_note_to_history( $user_id, sprintf( '[The user clicked Cancel for "%s". Nothing was changed.]', $label ) );
+			return array(
+				'label'     => $label,
+				'cancelled' => true,
+			);
+		}
+
+		$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( (string) $pending['ability'] ) : null;
+		if ( ! $ability instanceof \WP_Ability ) {
+			return new WP_Error( 'ability_not_found', __( 'That action is no longer available.', 'wp-ai-chat' ) );
+		}
+
+		$input    = is_array( $pending['input'] ) ? $pending['input'] : array();
+		$revision = null;
+
+		if ( 'revision' === $decision ) {
+			$key_name = self::target_key( $input );
+			if ( ! $key_name || ! class_exists( 'Content_Revisions_Store' ) || ! current_user_can( 'edit_post', (int) $input[ $key_name ] ) ) {
+				return new WP_Error( 'wp_ai_chat_no_revision', __( 'A revision could not be made for this change.', 'wp-ai-chat' ) );
+			}
+			$started = Content_Revisions_Store::start( (int) $input[ $key_name ] );
+			if ( is_wp_error( $started ) ) {
+				return $started;
+			}
+			$copy                = $started['copy'];
+			$revision            = Content_Revisions_Store::describe( $copy, Content_Revisions_Store::get_original( $copy ) );
+			$input[ $key_name ]  = $copy->ID; // Same change, applied to the copy.
+		}
+
+		// Normal permission checks still apply to the clicking user.
+		$result  = $ability->execute( $input );
+		$success = ! is_wp_error( $result );
+		$payload = $success ? $result : array(
+			'error' => $result->get_error_message(),
+			'code'  => $result->get_error_code(),
+		);
+
+		if ( $revision ) {
+			$this->append_note_to_history(
+				$user_id,
+				sprintf(
+					'[The user chose to make this change on a revision copy. %s Revision copy_id %d of "%s"; preview: %s. The live page is unchanged until the user asks to publish the revision (content-revisions/publish-revision with this copy_id). Further changes should target copy_id %d.]',
+					$success ? 'The change was applied to the copy.' : 'Applying the change to the copy failed: ' . $payload['error'],
+					$revision['copy_id'],
+					$revision['original_title'],
+					$revision['preview_url'],
+					$revision['copy_id']
+				)
+			);
+		} else {
+			$this->append_note_to_history(
+				$user_id,
+				sprintf(
+					'[The user clicked Confirm for "%s". %s %s]',
+					$label,
+					$success ? 'It ran successfully.' : 'It failed.',
+					wp_html_excerpt( (string) wp_json_encode( $payload ), 1500, '…' )
+				)
+			);
+		}
+
+		$cards = array();
+		if ( $revision && $success ) {
+			$this->touched_revisions = array( (int) $revision['copy_id'] => true );
+			$cards                   = $this->build_revision_cards();
+		}
+
+		return array(
+			'label'     => $label,
+			'ability'   => $ability->get_name(),
+			'success'   => $success,
+			'result'    => $payload,
+			'revision'  => $revision,
+			'revisions' => $cards,
+		);
+	}
+
+	private function append_note_to_history( int $user_id, string $note ): void {
+		if ( $user_id <= 0 ) {
+			return;
+		}
+		$state              = $this->get_conversation_state( $user_id );
+		$state['history'][] = ( new UserMessage( array( new MessagePart( $note ) ) ) )->toArray();
+		$this->save_conversation_state( $user_id, $state );
 	}
 
 	/**
@@ -688,8 +1023,16 @@ class WP_AI_Chat_Handler {
 			return new FunctionResponse( $function_id, $function_name, array( 'error' => sprintf( 'Ability "%s" not found', $ability_name ), 'code' => 'ability_not_found' ) );
 		}
 
-		$args   = $call->getArgs();
-		$input  = is_array( $args ) ? $args : array();
+		$args  = $call->getArgs();
+		$input = is_array( $args ) ? $args : array();
+
+		// Destructive abilities never run straight from the model: the user must click Confirm.
+		// Exception: edits to a draft or revision copy (not live) run right away, so the
+		// preview link already shows them. Only changes to live content wait for a click.
+		if ( self::is_destructive( $ability ) && ! self::is_unconfirmed_edit_allowed( $ability, $input ) ) {
+			return new FunctionResponse( $function_id, $function_name, $this->hold_for_confirmation( $ability, $input ) );
+		}
+
 		$result = $ability->execute( $input );
 
 		if ( is_wp_error( $result ) ) {

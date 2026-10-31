@@ -44,7 +44,50 @@
 
 	$messages.toggleClass( 'is-debug', debugOn );
 
+	// Model picker: lists whatever models the configured providers offer; nothing hardcoded.
+	const $modelSelect = $( '<select>' )
+		.addClass( 'wp-ai-chat-model-select' )
+		.attr( 'aria-label', 'Model' )
+		.append( $( '<option>' ).val( '' ).text( 'Loading models…' ) )
+		.prop( 'disabled', true );
+
+	$.ajax( {
+		url: window.wpAiChat.ajaxUrl,
+		type: 'POST',
+		data: { action: 'wp_ai_chat_send', nonce: window.wpAiChat.nonce, models: 'true' },
+		success: function ( response ) {
+			if ( ! response || ! response.success ) {
+				return;
+			}
+			const d = response.data;
+			const defaultLabel = d.site_default ? d.site_default.split( '::' )[1] : 'automatic';
+			$modelSelect.empty().append( $( '<option>' ).val( '' ).text( 'Default model (' + defaultLabel + ')' ) );
+			( d.groups || [] ).forEach( function ( group ) {
+				const $group = $( '<optgroup>' ).attr( 'label', group.name );
+				group.models.forEach( function ( m ) {
+					$group.append( $( '<option>' ).val( group.id + '::' + m.id ).text( m.name ) );
+				} );
+				$modelSelect.append( $group );
+			} );
+			$modelSelect.val( d.user_choice || '' ).prop( 'disabled', false );
+		},
+	} );
+
+	$modelSelect.on( 'change', function () {
+		const choice = $modelSelect.val();
+		$modelSelect.prop( 'disabled', true );
+		$.ajax( {
+			url: window.wpAiChat.ajaxUrl,
+			type: 'POST',
+			data: { action: 'wp_ai_chat_send', nonce: window.wpAiChat.nonce, set_model: 'true', model: choice },
+			complete: function () {
+				$modelSelect.prop( 'disabled', false );
+			},
+		} );
+	} );
+
 	$counterContainer.append( $counter );
+	$counterContainer.append( $modelSelect );
 	$counterContainer.append( $debugToggle );
 	$counterContainer.append( $resetButton );
 	$inputContainer.before( $warning );
@@ -164,6 +207,8 @@
 					}
 					const $reply = addMessage( data.response, 'assistant', $progressPanel.length ? null : data.actions, data.model_info, data.token_usage );
 					embedProgress( $progressPanel, $reply );
+					renderConfirmations( $reply, data.confirmations );
+					renderRevisionCards( $reply, data.revisions );
 				} else {
 					const errorData = response.data || {};
 					let errorMessage = 'Error: ' + ( errorData.message ? errorData.message : 'Unknown error' );
@@ -364,6 +409,14 @@
 				verbose = false;
 				break;
 			case 'ability_done':
+				if ( entry.details && 'awaiting_confirmation' === entry.details.status ) {
+					icon = '?';
+					text = label + ' · waiting for your confirmation';
+					payload = { result: entry.details };
+					state = 'is-call';
+					verbose = false;
+					break;
+				}
 				icon = false === entry.success ? '✗' : '✓';
 				text = label + ' · ' + summarizeResult( entry.details, entry.success, entry.summary );
 				payload = { result: undefined === entry.details ? {} : entry.details };
@@ -404,7 +457,7 @@
 	 * A single line: icon + text (+ optional Edit link). With a payload it becomes a
 	 * <details> whose summary is the line and whose body is the pretty-printed JSON.
 	 */
-	function buildLine( icon, text, payload, editUrl ) {
+	function buildLine( icon, text, payload, editUrl, viewUrl, viewText ) {
 		const $line = $( '<span>' ).addClass( 'wp-ai-chat-line' );
 		if ( icon ) {
 			$line.append( $( '<span>' ).addClass( 'wp-ai-chat-line-icon' ).attr( 'aria-hidden', 'true' ).text( icon ) );
@@ -416,6 +469,14 @@
 					.addClass( 'wp-ai-chat-action-link' )
 					.attr( { href: editUrl, target: '_blank', rel: 'noopener' } )
 					.text( 'Edit' )
+			);
+		}
+		if ( viewUrl ) {
+			$line.append(
+				$( '<a>' )
+					.addClass( 'wp-ai-chat-action-link' )
+					.attr( { href: viewUrl, target: '_blank', rel: 'noopener' } )
+					.text( viewText || 'View' )
 			);
 		}
 
@@ -587,6 +648,185 @@
 
 		return str.replace( /\u0000(\d+)\u0000/g, function ( m, i ) {
 			return links[ Number( i ) ];
+		} );
+	}
+
+	/**
+	 * Destructive ability calls are held server-side; show Confirm / Cancel for each.
+	 */
+	function renderConfirmations( $card, confirmations ) {
+		if ( ! $card || ! $card.length || ! Array.isArray( confirmations ) || ! confirmations.length ) {
+			return;
+		}
+		confirmations.forEach( function ( c ) {
+			const isChoice = 'revision_choice' === c.mode;
+			const $box = $( '<div>' ).addClass( 'wp-ai-chat-confirm' );
+			const isPublish = 'publish_revision' === c.mode;
+			let question = c.label + summarizeArgs( c.args );
+			if ( isChoice ) {
+				question = 'Change "' + ( c.target_title || 'this page' ) + '"? It\'s live.';
+			} else if ( isPublish ) {
+				question = 'Publish your changes to "' + c.target_title + '"? This replaces the live page.';
+			}
+			$box.append(
+				$( '<div>' ).addClass( 'wp-ai-chat-confirm-text' )
+					.append( isPublish ? buildLine( '?', question ) : buildLine( '?', question, { args: c.args || {} } ) )
+			);
+
+			const button = function ( text, primary, decision ) {
+				return $( '<button>' )
+					.attr( 'type', 'button' )
+					.addClass( primary ? 'button button-primary' : 'button' )
+					.text( text )
+					.on( 'click', function () {
+						resolveConfirmation( c, decision, $box, $buttons );
+					} );
+			};
+
+			const $buttons = $( '<div>' ).addClass( 'wp-ai-chat-confirm-buttons' );
+			if ( isChoice ) {
+				$buttons.append(
+					button( 'Make a revision (preview first)', true, 'revision' ),
+					button( 'Change live page now', false, 'confirm' ),
+					button( 'Cancel', false, 'cancel' )
+				);
+			} else {
+				$buttons.append( button( isPublish ? 'Publish' : c.label, true, 'confirm' ), button( 'Cancel', false, 'cancel' ) );
+			}
+			$box.append( $buttons );
+
+			$card.find( '.wp-ai-chat-meta' ).before( $box );
+			if ( ! $card.find( '.wp-ai-chat-meta' ).length ) {
+				$card.append( $box );
+			}
+		} );
+		$messages.scrollTop( $messages[0].scrollHeight );
+	}
+
+	/**
+	 * "What next" card after a revision is created or changed:
+	 * preview it, publish it over the live page, or ask for more changes.
+	 */
+	function renderRevisionCards( $card, revisions ) {
+		if ( ! $card || ! $card.length || ! Array.isArray( revisions ) || ! revisions.length ) {
+			return;
+		}
+		revisions.forEach( function ( r ) {
+			const $box = $( '<div>' ).addClass( 'wp-ai-chat-confirm wp-ai-chat-revision-card' );
+			$box.append(
+				$( '<div>' ).addClass( 'wp-ai-chat-confirm-text' ).append(
+					buildLine( '✎', 'Your revision of "' + r.target_title + '" is ready. The live page hasn\'t changed.' )
+				)
+			);
+
+			const $buttons = $( '<div>' ).addClass( 'wp-ai-chat-confirm-buttons' );
+			if ( /^https?:\/\//.test( r.preview_url || '' ) ) {
+				$buttons.append(
+					$( '<a>' ).addClass( 'button' ).attr( { href: r.preview_url, target: '_blank', rel: 'noopener' } ).text( 'Preview' )
+				);
+			}
+			$buttons.append(
+				$( '<button>' ).attr( 'type', 'button' ).addClass( 'button button-primary' ).text( 'Publish' )
+					.on( 'click', function () {
+						resolveConfirmation( r, 'confirm', $box, $buttons );
+					} ),
+				$( '<span>' ).addClass( 'wp-ai-chat-revision-hint' ).text( 'Want changes? Just tell me what to change.' )
+			);
+			$box.append( $buttons );
+
+			if ( $card.find( '.wp-ai-chat-meta' ).length ) {
+				$card.find( '.wp-ai-chat-meta' ).before( $box );
+			} else {
+				$card.append( $box );
+			}
+		} );
+		$messages.scrollTop( $messages[0].scrollHeight );
+	}
+
+	function resolveConfirmation( c, decision, $box, $buttons ) {
+		const isPublish = 'publish_revision' === c.mode;
+		$buttons.find( 'button' ).prop( 'disabled', true );
+		$buttons.append( $( '<span>' ).addClass( 'wp-ai-chat-confirm-working' ).text( 'cancel' === decision ? '' : 'Working…' ) );
+
+		// The box stays where it was (buttons replaced by what was clicked); the outcome
+		// arrives as a new message at the bottom of the chat, like any other reply.
+		const clicked = { confirm: isPublish ? 'Publish' : 'Confirm', revision: 'Make a revision', cancel: 'Cancel' }[ decision ] || decision;
+		const finish = function ( $line, state ) {
+			$buttons.replaceWith(
+				$( '<div>' ).addClass( 'wp-ai-chat-confirm-clicked' ).text( 'You clicked: ' + clicked )
+			);
+			$box.addClass( 'is-resolved' );
+
+			const $event = $( '<div>' )
+				.addClass( 'wp-ai-chat-message wp-ai-chat-message--assistant wp-ai-chat-message--event ' + ( state || '' ) )
+				.append( $line );
+			$messages.append( $event );
+			$messages.scrollTop( $messages[0].scrollHeight );
+			return $event;
+		};
+
+		$.ajax( {
+			url: window.wpAiChat.ajaxUrl,
+			type: 'POST',
+			data: {
+				action: 'wp_ai_chat_send',
+				nonce: window.wpAiChat.nonce,
+				confirm_action: 'true',
+				token: c.token,
+				decision: decision,
+			},
+			success: function ( response ) {
+				const data = response && response.data ? response.data : {};
+				if ( ! response || ! response.success ) {
+					finish( buildLine( '✗', data.message || 'Request failed.' ), 'is-error' );
+					return;
+				}
+				if ( data.cancelled ) {
+					finish( buildLine( '·', ( data.label || c.label ) + ' · cancelled, nothing changed' ), 'is-cancelled' );
+					return;
+				}
+				const result = data.result || {};
+				const ok = !! data.success;
+				if ( data.revision ) {
+					const rev = data.revision;
+					const $event = finish(
+						buildLine(
+							ok ? '✓' : '✗',
+							ok
+								? 'Revision of "' + rev.original_title + '" updated · live page unchanged'
+								: 'Revision created, but the change failed · ' + ( result.error || 'failed' ),
+							{ revision: rev, result: result },
+							/^https?:\/\//.test( rev.edit_url || '' ) ? rev.edit_url : null,
+							/^https?:\/\//.test( rev.preview_url || '' ) ? rev.preview_url : null,
+							'Preview'
+						),
+						ok ? 'is-success' : 'is-error'
+					);
+					renderRevisionCards( $event, data.revisions );
+					return;
+				}
+				if ( isPublish && ok ) {
+					finish(
+						buildLine( '✓', '"' + ( result.title || c.target_title ) + '" is live with your changes', { result: result }, null,
+							/^https?:\/\//.test( result.live_url || '' ) ? result.live_url : null, 'View page' ),
+						'is-success'
+					);
+					return;
+				}
+				finish(
+					buildLine(
+						ok ? '✓' : '✗',
+						( data.label || c.label ) + ' · ' + ( ok ? ( result.message || summarizeResult( result, true, 'done' ) ) : ( result.error || 'failed' ) ),
+						{ result: result },
+						extractEditUrl( result ),
+						ok && 'string' === typeof result.live_url && /^https?:\/\//.test( result.live_url ) ? result.live_url : null
+					),
+					ok ? 'is-success' : 'is-error'
+				);
+			},
+			error: function () {
+				finish( buildLine( '✗', 'Request failed. Nothing was confirmed.' ), 'is-error' );
+			},
 		} );
 	}
 

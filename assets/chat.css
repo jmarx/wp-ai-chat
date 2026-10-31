@@ -8,17 +8,14 @@
 	background: #fff;
 	border: 1px solid #ccd0d4;
 	box-shadow: 0 1px 1px rgb(0 0 0 / 4%);
-	margin-top: 20px;
+	margin-top: 12px;
 }
 
-.wp-ai-chat-intro {
-	padding: 20px;
-	border-bottom: 1px solid #e5e5e5;
-	background: #f9f9f9;
+.wp-ai-chat-abilities {
+	padding: 0 20px 16px;
 }
 
 .wp-ai-chat-abilities-toggle {
-	margin-top: 15px;
 	cursor: pointer;
 	display: inline-flex;
 	align-items: center;
@@ -69,28 +66,6 @@
 .wp-ai-chat-abilities-empty {
 	font-style: italic;
 	color: #777;
-}
-
-.wp-ai-chat-intro h2 {
-	margin-top: 0;
-}
-
-.wp-ai-chat-examples {
-	margin-top: 15px;
-	padding: 15px;
-	background: #fff;
-	border-left: 4px solid #2271b1;
-}
-
-.wp-ai-chat-examples ul {
-	margin: 10px 0;
-	padding-left: 20px;
-}
-
-.wp-ai-chat-examples li {
-	margin: 8px 0;
-	color: #646970;
-	font-style: italic;
 }
 
 .wp-ai-chat {
@@ -547,4 +522,86 @@
 
 .wp-ai-chat-message--error .wp-ai-chat-actions {
 	border-top-color: rgb(179 45 46 / 20%);
+}
+
+/* Confirm / Cancel for destructive abilities. */
+.wp-ai-chat-confirm {
+	margin: 10px 0 0;
+	padding: 10px 12px;
+	background: #fcf9e8;
+	border: 1px solid #f0e2a1;
+	border-radius: 6px;
+}
+
+.wp-ai-chat-confirm .wp-ai-chat-line-icon {
+	color: #996800;
+}
+
+.wp-ai-chat-confirm-buttons {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+}
+
+.wp-ai-chat-confirm-working {
+	font-size: 12px;
+	color: #646970;
+}
+
+.wp-ai-chat-confirm.is-resolved {
+	background: #f6f7f7;
+	border-color: #e5e5e5;
+}
+
+.wp-ai-chat-confirm.is-success .wp-ai-chat-line-icon {
+	color: #1e7e34;
+}
+
+.wp-ai-chat-confirm.is-error .wp-ai-chat-line-icon,
+.wp-ai-chat-confirm.is-error {
+	color: #b32d2e;
+}
+
+.wp-ai-chat-confirm.is-cancelled {
+	color: #646970;
+}
+
+/* "What next" card after a revision changes. */
+.wp-ai-chat-revision-card {
+	background: #f0f6fc;
+	border-color: #c5d9ed;
+}
+
+.wp-ai-chat-revision-card .wp-ai-chat-line-icon {
+	color: #2271b1;
+}
+
+.wp-ai-chat-revision-hint {
+	font-size: 12px;
+	color: #646970;
+}
+
+.wp-ai-chat-model-select {
+	max-width: 220px;
+	font-size: 13px;
+}
+
+/* After a click: the box records what was clicked; the outcome is a new message. */
+.wp-ai-chat-confirm-clicked {
+	margin-top: 6px;
+	font-size: 12px;
+	color: #646970;
+}
+
+.wp-ai-chat-message--event.is-success .wp-ai-chat-line-icon {
+	color: #1e7e34;
+}
+
+.wp-ai-chat-message--event.is-error {
+	color: #b32d2e;
+}
+
+.wp-ai-chat-message--event.is-cancelled {
+	color: #646970;
 }

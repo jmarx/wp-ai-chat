@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
  *
  * One route per job, all under wp-ai-chat/v1:
  *
- *   POST   /messages                Send a message, get the reply.
+ *   POST   /messages                Send a message (optionally with Media Library images), get the reply.
  *   GET    /progress/{id}           Live progress for a message still being answered.
  *   POST   /confirmations/{token}   Confirm, revise or cancel a held ability call.
  *   GET    /conversation            Conversation counters and limits.
@@ -46,16 +46,22 @@ class WP_AI_Chat_REST {
 		);
 
 		self::route( '/messages', 'POST', 'send_message', array(
-			'prompt'      => array(
+			'prompt'         => array(
 				'type'              => 'string',
 				'required'          => true,
 				'sanitize_callback' => 'sanitize_textarea_field',
 				'validate_callback' => array( __CLASS__, 'not_blank' ),
 			),
-			'progress_id' => array(
+			'progress_id'    => array(
 				'type'              => 'string',
 				'default'           => '',
 				'sanitize_callback' => 'sanitize_key',
+			),
+			'attachment_ids' => array(
+				'type'     => 'array',
+				'items'    => array( 'type' => 'integer' ),
+				'default'  => array(),
+				'maxItems' => WP_AI_Chat_Handler::MAX_IMAGES,
 			),
 		) );
 		self::route( '/progress/(?P<id>[a-z0-9_-]+)', 'GET', 'get_progress', array( 'id' => $key_arg ) );
@@ -129,7 +135,7 @@ class WP_AI_Chat_REST {
 	 * @return array|WP_Error
 	 */
 	public static function send_message( WP_REST_Request $request ) {
-		$result = ( new WP_AI_Chat_Handler() )->process_prompt( $request['prompt'], array(), null, $request['progress_id'] );
+		$result = ( new WP_AI_Chat_Handler() )->process_prompt( $request['prompt'], $request['attachment_ids'], null, $request['progress_id'] );
 
 		// Error data keeps the actions taken before the failure, so the UI can show them.
 		return is_wp_error( $result ) ? self::with_status( $result, 500 ) : $result;

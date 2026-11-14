@@ -156,6 +156,7 @@
 			addMessage( 'Error: ' + errorMessage( error ), 'error' );
 		} finally {
 			modelSelect.disabled = false;
+			updateAttachButton();
 		}
 	} );
 
@@ -178,9 +179,106 @@
 		] )
 	);
 
+	/* ------------------------------------------------------------------ *
+	 * Image attachments: uploaded to the Media Library, sent by ID
+	 * ------------------------------------------------------------------ */
+
+	// Models that accept images ("provider::model"), and whether the default model does.
+	const imageModels = new Set();
+	let defaultTakesImages = false;
+	let attachments = []; // { id, name, thumb, chip }; id is null while uploading.
+	let sending = false;
+
+	const fileInput = el( 'input', {
+		className: 'screen-reader-text',
+		attrs: { type: 'file', accept: 'image/jpeg,image/png,image/gif,image/webp', multiple: '', tabindex: '-1' },
+		on: { change: () => uploadFiles( Array.from( fileInput.files ) ) },
+	} );
+	const attachButton = el( 'button', {
+		className: 'button button-large wp-ai-chat-attach',
+		text: 'Add image',
+		attrs: { type: 'button', hidden: '' },
+		on: { click: () => fileInput.click() },
+	} );
+	const tray = el( 'div', { className: 'wp-ai-chat-attachments', attrs: { hidden: '' } } );
+
+	ui.submit.before( attachButton, fileInput );
+	ui.inputContainer.before( tray );
+
+	// Only offer uploads when the user may upload and the chosen model can see images.
+	function updateAttachButton() {
+		const choice = modelSelect.value;
+		const takesImages = choice ? imageModels.has( choice ) : defaultTakesImages;
+		attachButton.hidden = ! settings.canUpload || ! takesImages;
+		if ( attachButton.hidden ) {
+			attachments.forEach( ( a ) => a.chip.remove() );
+			attachments = [];
+			refreshTray();
+		}
+	}
+
+	function refreshTray() {
+		tray.hidden = ! attachments.length;
+		attachButton.disabled = attachments.length >= ( settings.maxImages || 4 );
+		ui.submit.disabled = sending || attachments.some( ( a ) => ! a.id );
+	}
+
+	function uploadFiles( files ) {
+		fileInput.value = '';
+		const room = ( settings.maxImages || 4 ) - attachments.length;
+		files.slice( 0, room ).forEach( uploadFile );
+	}
+
+	async function uploadFile( file ) {
+		const item = { id: null, name: file.name, thumb: '', chip: null };
+		item.chip = el( 'div', { className: 'wp-ai-chat-attachment is-uploading' }, [
+			el( 'span', { className: 'wp-ai-chat-attachment-name', text: 'Uploading ' + file.name + '…' } ),
+		] );
+		attachments.push( item );
+		tray.append( item.chip );
+		refreshTray();
+
+		const body = new window.FormData();
+		body.append( 'file', file, file.name );
+		try {
+			const media = await window.wp.apiFetch( { path: '/wp/v2/media', method: 'POST', body } );
+			const sizes = ( media.media_details && media.media_details.sizes ) || {};
+			item.id = media.id;
+			item.thumb = ( sizes.thumbnail || sizes.medium || {} ).source_url || media.source_url;
+			item.chip.classList.remove( 'is-uploading' );
+			item.chip.replaceChildren(
+				el( 'img', { attrs: { src: item.thumb, alt: '' } } ),
+				el( 'span', { className: 'wp-ai-chat-attachment-name', text: file.name } ),
+				el( 'button', {
+					className: 'wp-ai-chat-attachment-remove',
+					text: '×',
+					attrs: { type: 'button', 'aria-label': 'Remove ' + file.name + ' from this message' },
+					on: { click: () => removeAttachment( item ) },
+				} )
+			);
+		} catch ( error ) {
+			removeAttachment( item );
+			addMessage( 'Error: could not upload ' + file.name + ': ' + errorMessage( error ), 'error' );
+		}
+		refreshTray();
+	}
+
+	// Takes the image off this message only; it stays in the Media Library.
+	function removeAttachment( item ) {
+		item.chip.remove();
+		attachments = attachments.filter( ( a ) => a !== item );
+		refreshTray();
+	}
+
 	async function loadModels() {
 		try {
 			const data = await api( '/models' );
+			imageModels.clear();
+			( data.groups || [] ).forEach( ( group ) =>
+				group.models.forEach( ( model ) => model.images && imageModels.add( group.id + '::' + model.id ) )
+			);
+			// With no site default the AI client picks a model itself, and can pick one that takes images.
+			defaultTakesImages = data.site_default ? imageModels.has( data.site_default ) : imageModels.size > 0;
 			const defaultLabel = data.site_default ? data.site_default.split( '::' )[ 1 ] : 'automatic';
 			modelSelect.replaceChildren(
 				option( '', 'Default model (' + defaultLabel + ')' ),
@@ -194,6 +292,7 @@
 			);
 			modelSelect.value = data.user_choice || '';
 			modelSelect.disabled = false;
+			updateAttachButton();
 		} catch ( e ) {}
 	}
 
@@ -272,21 +371,32 @@
 	 * ------------------------------------------------------------------ */
 
 	async function sendPrompt() {
-		const prompt = ui.prompt.value.trim();
+		const images = attachments.filter( ( a ) => a.id );
+		// An image on its own is a message too.
+		const prompt = ui.prompt.value.trim() || ( images.length ? 'See the attached image.' : '' );
 		if ( ! prompt || ui.submit.disabled ) {
 			return;
 		}
 
 		const progressId = createProgressId();
-		addMessage( prompt, 'user' );
+		const sent = addMessage( prompt, 'user' );
+		if ( images.length ) {
+			sent.append(
+				el( 'div', { className: 'wp-ai-chat-sent-images' }, images.map( ( a ) => el( 'img', { attrs: { src: a.thumb, alt: a.name } } ) ) )
+			);
+		}
 		const panel = showLiveProgress( progressId );
 		ui.prompt.value = '';
-		ui.submit.disabled = true;
+		attachments.forEach( ( a ) => a.chip.remove() );
+		attachments = [];
+		sending = true;
+		refreshTray();
 
 		const pollTimer = window.setInterval( () => pollProgress( progressId ), 500 );
 
 		try {
-			showReply( await api( '/messages', { method: 'POST', data: { prompt, progress_id: progressId } } ), panel );
+			const data = { prompt, progress_id: progressId, attachment_ids: images.map( ( a ) => a.id ) };
+			showReply( await api( '/messages', { method: 'POST', data } ), panel );
 		} catch ( error ) {
 			const data = error.data || {};
 			let message = 'Error: ' + errorMessage( error, 'Unknown error' );
@@ -298,7 +408,8 @@
 			window.clearInterval( pollTimer );
 			await pollProgress( progressId );
 			finalizeLiveProgress( progressId );
-			ui.submit.disabled = false;
+			sending = false;
+			refreshTray();
 		}
 	}
 

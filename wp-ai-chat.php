@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP AI Chat
  * Description: Reusable chat UI with generic AI handler. Requires WordPress 7.0+ (bundled AI Client).
- * Version: 1.2.2
+ * Version: 1.4.0
  * Author: Everorange
  * License: GPL-2.0-or-later
  * Text Domain: wp-ai-chat
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'WP_AI_CHAT_VERSION', '1.2.2' );
+define( 'WP_AI_CHAT_VERSION', '1.4.0' );
 define( 'WP_AI_CHAT_PLUGIN_FILE', __FILE__ );
 define( 'WP_AI_CHAT_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -42,6 +42,19 @@ function wp_ai_chat_init(): void {
 	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat-runner.php';
 
 	WP_AI_Chat::instance();
+}
+
+/**
+ * Images the user attached to the chat message being answered right now.
+ *
+ * Lets abilities act on an upload without relying on the model to pass the ID
+ * along, e.g. to use it as a featured image. Empty outside a chat request (MCP,
+ * REST, WP-CLI) and when nothing was attached.
+ *
+ * @return int[] Attachment IDs, first attached first.
+ */
+function wp_ai_chat_attached_images(): array {
+	return class_exists( 'WP_AI_Chat_Handler' ) ? WP_AI_Chat_Handler::attached_images() : array();
 }
 
 /**

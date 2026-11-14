@@ -94,10 +94,11 @@
 }
 
 .wp-ai-chat-message--user {
-	background: #2271b1;
-	color: #fff;
+	background: #f0f6fc;
+	border: 1px solid #c5d9ed;
+	color: #1d2327;
 	margin-left: auto;
-	text-align: right;
+	width: fit-content;
 }
 
 .wp-ai-chat-message--assistant {
@@ -332,6 +333,87 @@
 
 .wp-ai-chat-status {
 	display: none;
+}
+
+/* Image attachments */
+.wp-ai-chat-attach {
+	height: auto;
+	font-size: 14px;
+}
+
+/* .button sets display, which would override the hidden attribute. */
+.wp-ai-chat-attach[hidden],
+.wp-ai-chat-attachments[hidden] {
+	display: none;
+}
+
+.wp-ai-chat-attachments {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-bottom: 8px;
+}
+
+.wp-ai-chat-attachment {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 6px;
+	background: #f6f7f7;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	font-size: 12px;
+}
+
+.wp-ai-chat-attachment.is-uploading {
+	color: #646970;
+	font-style: italic;
+}
+
+.wp-ai-chat-attachment img {
+	width: 40px;
+	height: 40px;
+	object-fit: cover;
+	border-radius: 3px;
+}
+
+.wp-ai-chat-attachment-name {
+	max-width: 160px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.wp-ai-chat-attachment-remove {
+	padding: 0 4px;
+	border: 0;
+	background: none;
+	color: #646970;
+	font-size: 16px;
+	line-height: 1;
+	cursor: pointer;
+}
+
+.wp-ai-chat-attachment-remove:hover,
+.wp-ai-chat-attachment-remove:focus {
+	color: #d63638;
+}
+
+.wp-ai-chat-sent-images {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 6px;
+	margin-top: 8px;
+}
+
+.wp-ai-chat-sent-images img {
+	width: 32px;
+	height: 32px;
+	object-fit: cover;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	background: #fff;
 }
 
 .screen-reader-text {

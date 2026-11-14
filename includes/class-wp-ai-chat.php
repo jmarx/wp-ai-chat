@@ -61,6 +61,8 @@ class WP_AI_Chat {
 			'wpAiChat',
 			array(
 				'restPath'            => '/' . WP_AI_Chat_REST::NAMESPACE,
+				'canUpload'           => current_user_can( 'upload_files' ),
+				'maxImages'           => WP_AI_Chat_Handler::MAX_IMAGES,
 				'abilitiesToggleShow' => __( 'Show registered abilities', 'wp-ai-chat' ),
 				'abilitiesToggleHide' => __( 'Hide registered abilities', 'wp-ai-chat' ),
 			)

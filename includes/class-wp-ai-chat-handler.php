@@ -7,6 +7,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
+use WordPress\AiClient\Files\DTO\File;
 use WordPress\AiClient\Messages\DTO\Message;
 use WordPress\AiClient\Messages\DTO\MessagePart;
 use WordPress\AiClient\Messages\DTO\ModelMessage;
@@ -22,6 +23,12 @@ use WordPress\AiClient\Providers\Http\DTO\RequestOptions;
 class WP_AI_Chat_Handler {
 
 	const MAX_ITERATIONS = 15;
+
+	/** Most images one message can carry. */
+	const MAX_IMAGES = 4;
+
+	/** Image types the model providers accept. */
+	const IMAGE_TYPES = array( 'image/jpeg', 'image/png', 'image/gif', 'image/webp' );
 
 	/** Seconds to wait for each model reply. Core's default (30) is too short for reasoning models. */
 	const REQUEST_TIMEOUT = 120;
@@ -75,10 +82,27 @@ class WP_AI_Chat_Handler {
 	private $model_choice = null;
 
 	/**
+	 * Images sent with the message being answered (attachment IDs, in the order
+	 * attached). Read by abilities through wp_ai_chat_attached_images().
+	 *
+	 * @var int[]
+	 */
+	private static $attached_images = array();
+
+	/**
+	 * Images the user attached to the message being answered.
+	 *
+	 * @return int[] Attachment IDs, first attached first; empty outside a chat request.
+	 */
+	public static function attached_images(): array {
+		return self::$attached_images;
+	}
+
+	/**
 	 * Process a user prompt with AI (conversation loop + abilities).
 	 *
 	 * @param string     $prompt         User's message.
-	 * @param array<int> $attachment_ids Optional. Image attachment IDs (requires image handler via filter).
+	 * @param array<int> $attachment_ids Optional. Media Library image IDs sent to the model with the prompt.
 	 * @param array|null $history        Optional. Client-provided history [ [ 'role' => 'user'|'assistant', 'content' => '...' ], ... ]. If null, loads from user meta.
 	 * @param string     $progress_id    Optional. Client progress session ID for live status polling.
 	 * @return array|WP_Error { response, actions?, model_info?, token_usage?, state? }
@@ -103,7 +127,8 @@ class WP_AI_Chat_Handler {
 			wp_timezone_string()
 		);
 
-		$message_parts = array( new MessagePart( $prompt ) );
+		self::$attached_images = array();
+		$message_parts         = array_merge( array( new MessagePart( $prompt ) ), $this->image_parts( $attachment_ids ) );
 		$message_parts = apply_filters( 'wp_ai_chat_user_message_parts', $message_parts, $prompt, $attachment_ids );
 		$original_user_message = new UserMessage( $message_parts );
 
@@ -1128,6 +1153,64 @@ class WP_AI_Chat_Handler {
 
 		// Core checks the allowed list, runs the ability and shapes the result to its output schema.
 		return $this->resolver->execute_ability( $call );
+	}
+
+	/**
+	 * Message parts for the images the user attached: a note naming each attachment ID,
+	 * then the image itself. The notes stay in the conversation history (the images
+	 * don't), so the model can still use an ID, e.g. as a featured image, later on.
+	 *
+	 * @param array<int> $attachment_ids Media Library attachment IDs.
+	 * @return MessagePart[]
+	 */
+	private function image_parts( array $attachment_ids ): array {
+		$parts = array();
+		$ids   = array_slice( array_unique( array_filter( array_map( 'intval', $attachment_ids ) ) ), 0, self::MAX_IMAGES );
+
+		foreach ( $ids as $id ) {
+			$file = self::image_file( $id );
+			if ( null === $file ) {
+				$parts[] = new MessagePart( sprintf( '[Attachment %d could not be sent: it is not an image (JPEG, PNG, GIF or WebP) this user can use.]', $id ) );
+				continue;
+			}
+			$parts[] = new MessagePart( sprintf( '[The user attached an image from the Media Library: attachment ID %1$d, "%2$s".]', $id, get_the_title( $id ) ) );
+			$parts[] = new MessagePart( $file );
+
+			self::$attached_images[] = $id;
+		}
+
+		return $parts;
+	}
+
+	/**
+	 * A Media Library image, ready to send to the model. Uses the "large" size when
+	 * there is one, so phone photos aren't sent at full size.
+	 *
+	 * @param int $id Attachment ID.
+	 * @return File|null Null when it isn't an image the current user may see.
+	 */
+	private static function image_file( int $id ): ?File {
+		if ( ! wp_attachment_is_image( $id ) || ! current_user_can( 'read_post', $id ) ) {
+			return null;
+		}
+
+		$path  = get_attached_file( $id );
+		$mime  = (string) get_post_mime_type( $id );
+		$large = image_get_intermediate_size( $id, 'large' );
+		if ( $large && ! empty( $large['path'] ) ) {
+			$path = trailingslashit( wp_get_upload_dir()['basedir'] ) . $large['path'];
+			$mime = $large['mime-type'] ?? $mime;
+		}
+
+		if ( ! $path || ! is_readable( $path ) || ! in_array( $mime, self::IMAGE_TYPES, true ) ) {
+			return null;
+		}
+
+		try {
+			return new File( $path, $mime );
+		} catch ( \Throwable $e ) {
+			return null;
+		}
 	}
 
 	/**

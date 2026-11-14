@@ -10,14 +10,17 @@
 defined( 'ABSPATH' ) || exit;
 
 use WordPress\AiClient\AiClient;
+use WordPress\AiClient\Messages\Enums\ModalityEnum;
 use WordPress\AiClient\Providers\Models\DTO\ModelRequirements;
+use WordPress\AiClient\Providers\Models\DTO\RequiredOption;
 use WordPress\AiClient\Providers\Models\Enums\CapabilityEnum;
+use WordPress\AiClient\Providers\Models\Enums\OptionEnum;
 
 class WP_AI_Chat_Models {
 
 	const OPTION_DEFAULT = 'wp_ai_chat_default_model';
 	const USER_META      = 'wp_ai_chat_model';
-	const CACHE_KEY      = 'wp_ai_chat_available_models';
+	const CACHE_KEY      = 'wp_ai_chat_available_models_v2';
 	const CACHE_TTL      = HOUR_IN_SECONDS;
 
 	public static function init(): void {
@@ -28,9 +31,10 @@ class WP_AI_Chat_Models {
 	/**
 	 * Text-generation models from every configured provider, grouped by provider.
 	 * Dated snapshots (e.g. gpt-5-2025-08-07) are left out to keep the list readable.
+	 * Each model says whether it accepts images, so the chat only offers uploads where they work.
 	 *
 	 * @param bool $refresh Bypass the cache.
-	 * @return array<int, array{id: string, name: string, models: array<int, array{id: string, name: string}>}>
+	 * @return array<int, array{id: string, name: string, models: array<int, array{id: string, name: string, images: bool}>}>
 	 */
 	public static function available( bool $refresh = false ): array {
 		$cached = $refresh ? false : get_transient( self::CACHE_KEY );
@@ -44,6 +48,10 @@ class WP_AI_Chat_Models {
 		$groups = array();
 		try {
 			$requirements = new ModelRequirements( array( CapabilityEnum::textGeneration() ), array() );
+			$with_images  = new ModelRequirements(
+				array( CapabilityEnum::textGeneration() ),
+				array( new RequiredOption( OptionEnum::inputModalities(), array( ModalityEnum::text(), ModalityEnum::image() ) ) )
+			);
 			foreach ( AiClient::defaultRegistry()->findModelsMetadataForSupport( $requirements ) as $provider_models ) {
 				$provider = $provider_models->getProvider();
 				$models   = array();
@@ -52,8 +60,9 @@ class WP_AI_Chat_Models {
 						continue;
 					}
 					$models[] = array(
-						'id'   => $model->getId(),
-						'name' => $model->getName(),
+						'id'     => $model->getId(),
+						'name'   => $model->getName(),
+						'images' => $with_images->areMetBy( $model ),
 					);
 				}
 				if ( $models ) {

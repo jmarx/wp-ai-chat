@@ -72,6 +72,11 @@ class WP_AI_Chat_Handler {
 
 		$abilities = $this->get_abilities();
 		$system_content = (string) apply_filters( 'wp_ai_chat_system_instruction', 'You are a helpful assistant.', $prompt, $history ?? array() );
+		$system_content .= "\n\n" . sprintf(
+			'Current date and time: %1$s (site timezone: %2$s). Treat this as "today" when interpreting relative dates like "next Saturday" or "tomorrow".',
+			wp_date( 'l, F j, Y, g:i a' ),
+			wp_timezone_string()
+		);
 
 		$message_parts = array( new MessagePart( $prompt ) );
 		$message_parts = apply_filters( 'wp_ai_chat_user_message_parts', $message_parts, $prompt, $attachment_ids );

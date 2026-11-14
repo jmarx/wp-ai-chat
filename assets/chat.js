@@ -668,32 +668,72 @@
 
 	/**
 	 * Minimal, safe Markdown → HTML for model replies: paragraphs, line breaks,
-	 * bullet/numbered lists, **bold**, *italic*, `code`, [links](url) and bare URLs.
+	 * bullet/numbered lists, tables, **bold**, *italic*, `code`, [links](url) and bare URLs.
 	 * Everything is HTML-escaped first; only http(s) links become <a>.
 	 */
 	function renderMarkdown( text ) {
-		const blocks = escapeHtml( text || '' ).replace( /\r\n/g, '\n' ).trim().split( /\n{2,}/ );
-		const listOf = ( tag, lines, marker ) =>
-			'<' + tag + '>' + lines.map( ( l ) => '<li>' + renderInline( l.replace( marker, '' ) ) + '</li>' ).join( '' ) + '</' + tag + '>';
-
-		return blocks
-			.map( ( block ) => {
-				const lines = block.split( '\n' );
-				const bullet = /^\s*[-*•]\s+/;
-				const numbered = /^\s*\d+[.)]\s+/;
-				if ( lines.every( ( l ) => bullet.test( l ) ) ) {
-					return listOf( 'ul', lines, bullet );
-				}
-				if ( lines.every( ( l ) => numbered.test( l ) ) ) {
-					return listOf( 'ol', lines, numbered );
-				}
-				const heading = block.match( /^(#{1,4})\s+(.+)$/ );
-				if ( heading && 1 === lines.length ) {
-					return '<p class="wp-ai-chat-md-heading">' + renderInline( heading[ 2 ] ) + '</p>';
-				}
-				return '<p>' + lines.map( renderInline ).join( '<br>' ) + '</p>';
-			} )
+		return escapeHtml( text || '' )
+			.replace( /\r\n/g, '\n' )
+			.trim()
+			.split( /\n{2,}/ )
+			.map( renderBlock )
 			.join( '' );
+	}
+
+	const BULLET = /^\s*[-*•]\s+/;
+	const NUMBERED = /^\s*\d+[.)]\s+/;
+	// The |---|:---:| line under a table's header row.
+	const TABLE_DIVIDER = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+
+	/** One block of already-escaped text (no blank lines inside). */
+	function renderBlock( block ) {
+		const lines = block.split( '\n' ).filter( ( l ) => '' !== l.trim() );
+		if ( ! lines.length ) {
+			return '';
+		}
+
+		// A table can sit in the middle of a block: render the text around it separately.
+		const tableStart = lines.findIndex( ( l, i ) => l.includes( '|' ) && TABLE_DIVIDER.test( lines[ i + 1 ] || '' ) );
+		if ( -1 !== tableStart ) {
+			let tableEnd = tableStart + 2;
+			while ( tableEnd < lines.length && lines[ tableEnd ].includes( '|' ) ) {
+				tableEnd++;
+			}
+			return (
+				renderBlock( lines.slice( 0, tableStart ).join( '\n' ) ) +
+				renderTable( lines.slice( tableStart, tableEnd ) ) +
+				renderBlock( lines.slice( tableEnd ).join( '\n' ) )
+			);
+		}
+
+		if ( lines.every( ( l ) => BULLET.test( l ) ) ) {
+			return renderList( 'ul', lines, BULLET );
+		}
+		if ( lines.every( ( l ) => NUMBERED.test( l ) ) ) {
+			return renderList( 'ol', lines, NUMBERED );
+		}
+		const heading = lines[ 0 ].match( /^(#{1,4})\s+(.+)$/ );
+		if ( heading && 1 === lines.length ) {
+			return '<p class="wp-ai-chat-md-heading">' + renderInline( heading[ 2 ] ) + '</p>';
+		}
+		return '<p>' + lines.map( renderInline ).join( '<br>' ) + '</p>';
+	}
+
+	function renderList( tag, lines, marker ) {
+		return '<' + tag + '>' + lines.map( ( l ) => '<li>' + renderInline( l.replace( marker, '' ) ) + '</li>' ).join( '' ) + '</' + tag + '>';
+	}
+
+	/** Header row, divider row, then body rows. Wrapped so wide tables scroll, not overflow. */
+	function renderTable( lines ) {
+		const cells = ( line ) => line.trim().replace( /^\|/, '' ).replace( /\|$/, '' ).split( '|' ).map( ( c ) => c.trim() );
+		const row = ( line, tag ) => '<tr>' + cells( line ).map( ( c ) => '<' + tag + '>' + renderInline( c ) + '</' + tag + '>' ).join( '' ) + '</tr>';
+
+		return (
+			'<div class="wp-ai-chat-table-wrap"><table class="wp-ai-chat-table">' +
+			'<thead>' + row( lines[ 0 ], 'th' ) + '</thead>' +
+			'<tbody>' + lines.slice( 2 ).map( ( l ) => row( l, 'td' ) ).join( '' ) + '</tbody>' +
+			'</table></div>'
+		);
 	}
 
 	/** Inline Markdown on already-escaped text. */

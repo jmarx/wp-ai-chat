@@ -1,0 +1,15 @@
+{
+	"name": "jmarx/wp-ai-chat",
+	"description": "Reusable chat UI with generic AI handler for WordPress.",
+	"type": "wordpress-plugin",
+	"license": "GPL-2.0-or-later",
+	"require-dev": {
+		"phpunit/phpunit": "^11.5 || ^12.0"
+	},
+	"scripts": {
+		"test": "phpunit"
+	},
+	"config": {
+		"sort-packages": true
+	}
+}

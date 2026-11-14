@@ -39,6 +39,7 @@ function wp_ai_chat_init(): void {
 	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat-progress.php';
 	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat-models.php';
 	WP_AI_Chat_Models::init();
+	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat-call-guard.php';
 	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat-handler.php';
 	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat.php';
 	require_once WP_AI_CHAT_PLUGIN_DIR . 'includes/class-wp-ai-chat-runner.php';

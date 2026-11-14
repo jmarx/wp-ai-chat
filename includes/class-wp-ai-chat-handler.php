@@ -309,6 +309,33 @@ class WP_AI_Chat_Handler {
 	}
 
 	/**
+	 * Final result returned by the conversation loop.
+	 *
+	 * @param string     $response_text     Text shown to the user.
+	 * @param array      $actions_taken     Ability calls made this turn.
+	 * @param array|null $model_info        Provider and model name.
+	 * @param int        $prompt_tokens     Prompt tokens used.
+	 * @param int        $completion_tokens Completion tokens used.
+	 * @param int        $total_tokens      Total tokens used.
+	 * @return array
+	 */
+	private function build_loop_result( string $response_text, array $actions_taken, ?array $model_info, int $prompt_tokens, int $completion_tokens, int $total_tokens ): array {
+		return array(
+			'response'      => $response_text,
+			'confirmations' => $this->pending_confirmations,
+			'revisions'     => $this->build_revision_cards(),
+			'actions'       => $actions_taken,
+			'model_info'    => $model_info,
+			'token_usage'   => array(
+				'prompt_tokens'     => $prompt_tokens,
+				'completion_tokens' => $completion_tokens,
+				'total_tokens'      => $total_tokens,
+				'estimated_cost'    => ( $prompt_tokens / 1000 * 0.01 ) + ( $completion_tokens / 1000 * 0.03 ),
+			),
+		);
+	}
+
+	/**
 	 * Process conversation loop with function calling.
 	 *
 	 * @param object $builder WordPress core prompt builder from wp_ai_client_prompt() (WP 7.0+).
@@ -321,6 +348,7 @@ class WP_AI_Chat_Handler {
 		array $existing_history = array()
 	) {
 		$actions_taken        = array();
+		$call_guard           = new WP_AI_Chat_Call_Guard();
 		$iterations           = 0;
 		$conversation_history = array();
 		$model_info           = null;
@@ -388,23 +416,11 @@ class WP_AI_Chat_Handler {
 					);
 				}
 
-				$estimated_cost = ( $total_prompt_tokens / 1000 * 0.01 ) + ( $total_completion_tokens / 1000 * 0.03 );
-				return array(
-					'response'      => $response_text,
-					'confirmations' => $this->pending_confirmations,
-					'revisions'     => $this->build_revision_cards(),
-					'actions'     => $actions_taken,
-					'model_info'  => $model_info,
-					'token_usage' => array(
-						'prompt_tokens'     => $total_prompt_tokens,
-						'completion_tokens' => $total_completion_tokens,
-						'total_tokens'      => $total_tokens,
-						'estimated_cost'    => $estimated_cost,
-					),
-				);
+				return $this->build_loop_result( $response_text, $actions_taken, $model_info, $total_prompt_tokens, $total_completion_tokens, $total_tokens );
 			}
 
 			$function_response_messages = array();
+			$stopped_on                 = null;
 			foreach ( $message->getParts() as $part ) {
 				if ( $part->getType()->isFunctionCall() ) {
 					$function_call = $part->getFunctionCall();
@@ -412,6 +428,14 @@ class WP_AI_Chat_Handler {
 						$function_name = $function_call->getName();
 						$ability_name  = $this->function_name_to_ability_name( $function_name );
 						$ability_args  = $function_call->getArgs();
+
+						// Same ability + same arguments too often this turn: block, then stop.
+						$guard_name     = (string) ( $ability_name ?? $function_name );
+						$guard_decision = $call_guard->check( $guard_name, is_array( $ability_args ) ? $ability_args : array() );
+						if ( WP_AI_Chat_Call_Guard::STOP === $guard_decision ) {
+							$stopped_on = $guard_name;
+							break;
+						}
 
 						if ( $this->progress instanceof WP_AI_Chat_Progress && $ability_name ) {
 							$this->progress->add_entry(
@@ -430,7 +454,9 @@ class WP_AI_Chat_Handler {
 								);
 							}
 
-							$function_response = $this->execute_ability( $function_call );
+							$function_response = WP_AI_Chat_Call_Guard::BLOCK === $guard_decision
+								? new FunctionResponse( $function_call->getId() ?? 'unknown', $function_name ?? 'unknown', WP_AI_Chat_Call_Guard::blocked_result( $guard_name ) )
+								: $this->execute_ability( $function_call );
 							$function_response_messages[] = new UserMessage( array( new MessagePart( $function_response ) ) );
 							$exec_result = $function_response->getResponse();
 							$this->note_revision_touch( is_array( $ability_args ) ? $ability_args : array(), $exec_result );
@@ -467,6 +493,15 @@ class WP_AI_Chat_Handler {
 						}
 					}
 				}
+			}
+
+			if ( null !== $stopped_on ) {
+				/* translators: %s: ability name */
+				$stop_text = sprintf( __( 'Stopped: the assistant kept repeating the same action (%s) with the same details. Try rephrasing your request.', 'wp-ai-chat' ), $stopped_on );
+				if ( $this->progress instanceof WP_AI_Chat_Progress ) {
+					$this->progress->add_entry( 'repeated_call_stop', $stop_text, array( 'iteration' => $iterations, 'ability' => $stopped_on ) );
+				}
+				return $this->build_loop_result( $stop_text, $actions_taken, $model_info, $total_prompt_tokens, $total_completion_tokens, $total_tokens );
 			}
 
 			$conversation_history[] = $message;

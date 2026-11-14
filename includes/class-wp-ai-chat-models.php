@@ -68,7 +68,10 @@ class WP_AI_Chat_Models {
 			return array(); // Not cached, so a transient provider error retries next time.
 		}
 
-		set_transient( self::CACHE_KEY, $groups, self::CACHE_TTL );
+		// An empty list usually means no key yet; don't cache it, so adding a key shows models right away.
+		if ( $groups ) {
+			set_transient( self::CACHE_KEY, $groups, self::CACHE_TTL );
+		}
 		return $groups;
 	}
 

@@ -14,6 +14,7 @@ use WordPress\AiClient\Messages\DTO\UserMessage;
 use WordPress\AiClient\Tools\DTO\FunctionCall;
 use WordPress\AiClient\Tools\DTO\FunctionDeclaration;
 use WordPress\AiClient\Tools\DTO\FunctionResponse;
+use WordPress\AiClient\Providers\Http\DTO\RequestOptions;
 
 /**
  * Class WP_AI_Chat_Handler.
@@ -21,6 +22,9 @@ use WordPress\AiClient\Tools\DTO\FunctionResponse;
 class WP_AI_Chat_Handler {
 
 	const MAX_ITERATIONS = 15;
+
+	/** Seconds to wait for each model reply. Core's default (30) is too short for reasoning models. */
+	const REQUEST_TIMEOUT = 120;
 	const MAX_PROMPTS    = 100;
 	const MAX_CHARS      = 400000;
 	const META_KEY       = 'wp_ai_chat_conversation_state';
@@ -62,6 +66,13 @@ class WP_AI_Chat_Handler {
 	 * @var string[]
 	 */
 	private $declared_abilities = array();
+
+	/**
+	 * The user's (or site's) model choice for the current request; null = automatic.
+	 *
+	 * @var array|null
+	 */
+	private $model_choice = null;
 
 	/**
 	 * Process a user prompt with AI (conversation loop + abilities).
@@ -127,16 +138,9 @@ class WP_AI_Chat_Handler {
 			$existing_history = $this->load_history_from_state( $state['history'] );
 		}
 
-		$initial_messages = array_merge( $existing_history, array( $original_user_message ) );
-		$builder           = wp_ai_client_prompt( $initial_messages );
-		$builder->using_system_instruction( $system_content );
-
 		// The user's model, else the site default (Settings → AI Chat). No choice at all:
 		// the AI client picks from whatever providers are configured.
-		$model_choice = WP_AI_Chat_Models::resolve( $user_id );
-		if ( $model_choice ) {
-			$builder->using_model_preference( $model_choice );
-		}
+		$this->model_choice = WP_AI_Chat_Models::resolve( $user_id );
 
 		$function_declarations = array();
 		$declared_abilities    = array();
@@ -169,14 +173,11 @@ class WP_AI_Chat_Handler {
 			);
 		}
 
-		if ( ! empty( $function_declarations ) ) {
-			$builder->using_function_declarations( ...$function_declarations );
-		}
-
 		// Core matches and runs ability calls; only the abilities declared above are allowed.
 		$this->declared_abilities = $declared_abilities;
 		$this->resolver           = new WP_AI_Client_Ability_Function_Resolver( ...$declared_abilities );
 
+		$builder = $this->new_builder( array_merge( $existing_history, array( $original_user_message ) ), $system_content, $function_declarations );
 		$builder = apply_filters( 'wp_ai_chat_prompt_builder', $builder, $prompt, $history ?? array(), '' );
 
 		$result = $this->process_conversation_loop(
@@ -328,6 +329,40 @@ class WP_AI_Chat_Handler {
 	 */
 	public function get_registered_abilities(): array {
 		return $this->get_abilities();
+	}
+
+	/**
+	 * A prompt builder with everything every round needs: system instruction, model
+	 * choice, abilities and a timeout long enough for slower models.
+	 *
+	 * @param array                 $messages              Conversation so far.
+	 * @param string                $system_instruction    System instruction.
+	 * @param FunctionDeclaration[] $function_declarations Abilities offered to the model.
+	 * @return WP_AI_Client_Prompt_Builder
+	 */
+	private function new_builder( array $messages, string $system_instruction, array $function_declarations ) {
+		$builder = wp_ai_client_prompt( $messages );
+
+		if ( '' !== $system_instruction ) {
+			$builder->using_system_instruction( $system_instruction );
+		}
+		if ( $this->model_choice ) {
+			$builder->using_model_preference( $this->model_choice );
+		}
+		if ( $function_declarations ) {
+			$builder->using_function_declarations( ...$function_declarations );
+		}
+
+		/**
+		 * Filters how many seconds the chat waits for each model reply.
+		 *
+		 * @param float $timeout Seconds. Default WP_AI_Chat_Handler::REQUEST_TIMEOUT.
+		 */
+		$options = new RequestOptions();
+		$options->setTimeout( (float) apply_filters( 'wp_ai_chat_request_timeout', (float) self::REQUEST_TIMEOUT ) );
+		$builder->using_request_options( $options );
+
+		return $builder;
 	}
 
 	/**
@@ -529,16 +564,11 @@ class WP_AI_Chat_Handler {
 			$conversation_history[] = $message;
 			$conversation_history   = array_merge( $conversation_history, $function_response_messages );
 
-			$all_messages = array_merge( $existing_history, array( $original_user_message ) );
-			$all_messages = array_merge( $all_messages, $conversation_history );
-			$builder      = wp_ai_client_prompt( $all_messages );
-
-			if ( '' !== $system_instruction ) {
-				$builder->using_system_instruction( $system_instruction );
-			}
-			if ( ! empty( $function_declarations ) ) {
-				$builder->using_function_declarations( ...$function_declarations );
-			}
+			$builder = $this->new_builder(
+				array_merge( $existing_history, array( $original_user_message ), $conversation_history ),
+				$system_instruction,
+				$function_declarations
+			);
 		}
 
 		if ( $this->progress instanceof WP_AI_Chat_Progress ) {

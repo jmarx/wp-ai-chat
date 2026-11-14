@@ -1,3 +1,8 @@
+/* Elements toggled with the hidden attribute stay hidden whatever their display. */
+.wp-ai-chat-wrap [hidden] {
+	display: none !important;
+}
+
 /* WP AI Chat admin page layout and styling */
 
 .wp-ai-chat-wrap {
@@ -48,7 +53,6 @@
 	border: 1px dashed #ccd0d4;
 	font-size: 13px;
 	color: #646970;
-	display: none;
 }
 
 .wp-ai-chat-abilities-list {

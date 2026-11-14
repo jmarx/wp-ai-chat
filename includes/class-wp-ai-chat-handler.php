@@ -50,6 +50,20 @@ class WP_AI_Chat_Handler {
 	private $progress = null;
 
 	/**
+	 * Core's ability-call resolver for the current request (declared abilities only).
+	 *
+	 * @var WP_AI_Client_Ability_Function_Resolver|null
+	 */
+	private $resolver = null;
+
+	/**
+	 * Ability names declared to the model for the current request.
+	 *
+	 * @var string[]
+	 */
+	private $declared_abilities = array();
+
+	/**
 	 * Process a user prompt with AI (conversation loop + abilities).
 	 *
 	 * @param string     $prompt         User's message.
@@ -63,10 +77,10 @@ class WP_AI_Chat_Handler {
 			return new WP_Error( 'wp_ai_client_not_available', __( 'WordPress AI Client is not available (requires WordPress 7.0+).', 'wp-ai-chat' ) );
 		}
 
-		if ( ! $this->has_api_key() ) {
+		if ( ! self::ai_available() ) {
 			return new WP_Error(
 				'no_api_key',
-				__( 'AI API key is not configured. Please configure your API credentials in Settings > AI Credentials.', 'wp-ai-chat' )
+				__( 'No AI provider is available. Add an API key in Settings > Connectors.', 'wp-ai-chat' )
 			);
 		}
 
@@ -125,15 +139,18 @@ class WP_AI_Chat_Handler {
 		}
 
 		$function_declarations = array();
+		$declared_abilities    = array();
 		foreach ( $abilities as $ability_name ) {
 			$ability = function_exists( 'wp_get_ability' ) ? wp_get_ability( $ability_name ) : null;
 			if ( ! $ability ) {
 				continue;
 			}
 			$ability_name  = $ability->get_name();
-			$function_name = 'wpab__' . str_replace( '/', '__', $ability_name );
+			$function_name = WP_AI_Client_Ability_Function_Resolver::ability_name_to_function_name( $ability_name );
 			$input_schema  = $ability->get_input_schema();
-			$schema_for_declaration = $this->normalize_schema_for_function_calling( $input_schema );
+			// Core's schema cleanup first, then flatten what OpenAI still rejects (core doesn't).
+			$prepared_schema        = ! empty( $input_schema ) ? wp_prepare_json_schema_for_client( $input_schema ) : $input_schema;
+			$schema_for_declaration = $this->normalize_schema_for_function_calling( $prepared_schema );
 
 			// normalize_schema_for_function_calling() returns null both for a
 			// genuinely parameterless ability and for one whose schema couldn't
@@ -144,6 +161,7 @@ class WP_AI_Chat_Handler {
 				continue;
 			}
 
+			$declared_abilities[]    = $ability_name;
 			$function_declarations[] = new FunctionDeclaration(
 				$function_name,
 				$ability->get_description(),
@@ -154,6 +172,10 @@ class WP_AI_Chat_Handler {
 		if ( ! empty( $function_declarations ) ) {
 			$builder->using_function_declarations( ...$function_declarations );
 		}
+
+		// Core matches and runs ability calls; only the abilities declared above are allowed.
+		$this->declared_abilities = $declared_abilities;
+		$this->resolver           = new WP_AI_Client_Ability_Function_Resolver( ...$declared_abilities );
 
 		$builder = apply_filters( 'wp_ai_chat_prompt_builder', $builder, $prompt, $history ?? array(), '' );
 
@@ -404,7 +426,7 @@ class WP_AI_Chat_Handler {
 
 			$message = $candidates[0]->getMessage();
 
-			if ( ! $this->has_ability_calls( $message ) ) {
+			if ( ! $this->resolver->has_ability_calls( $message ) ) {
 				$text_content = $this->extract_text_content( $message );
 				$response_text = $text_content !== '' ? $text_content : __( 'Task completed!', 'wp-ai-chat' );
 
@@ -424,9 +446,9 @@ class WP_AI_Chat_Handler {
 			foreach ( $message->getParts() as $part ) {
 				if ( $part->getType()->isFunctionCall() ) {
 					$function_call = $part->getFunctionCall();
-					if ( $function_call instanceof FunctionCall && $this->is_ability_call( $function_call ) ) {
+					if ( $function_call instanceof FunctionCall && $this->resolver->is_ability_call( $function_call ) ) {
 						$function_name = $function_call->getName();
-						$ability_name  = $this->function_name_to_ability_name( $function_name );
+						$ability_name  = WP_AI_Client_Ability_Function_Resolver::function_name_to_ability_name( (string) $function_name );
 						$ability_args  = $function_call->getArgs();
 
 						// Same ability + same arguments too often this turn: block, then stop.
@@ -972,7 +994,7 @@ class WP_AI_Chat_Handler {
 		if ( 'prompt_invalid_argument' === $code && strpos( $message, 'No models found' ) !== false ) {
 			return new WP_Error(
 				'no_models_found',
-				__( 'No AI models found. Please verify your API key in Settings → AI Credentials and try again.', 'wp-ai-chat' )
+				__( 'No AI models found. Please verify your API key in Settings → Connectors and try again.', 'wp-ai-chat' )
 			);
 		}
 
@@ -998,11 +1020,11 @@ class WP_AI_Chat_Handler {
 		}
 
 		if ( strpos( $message, '401' ) !== false || strpos( $message, 'Unauthorized' ) !== false ) {
-			$error_msg = __( 'Invalid API credentials. Please check your API key in Settings > AI Credentials.', 'wp-ai-chat' );
+			$error_msg = __( 'Invalid API credentials. Please check your API key in Settings > Connectors.', 'wp-ai-chat' );
 			if ( $provider_name ) {
 				$error_msg = sprintf(
 					/* translators: %s: AI provider name (e.g. OpenAI). */
-					__( 'Invalid API credentials for %s. Please check your API key in Settings > AI Credentials.', 'wp-ai-chat' ),
+					__( 'Invalid API credentials for %s. Please check your API key in Settings > Connectors.', 'wp-ai-chat' ),
 					$provider_name
 				);
 			}
@@ -1028,40 +1050,17 @@ class WP_AI_Chat_Handler {
 		return implode( ' ', $text_parts );
 	}
 
-	private function has_ability_calls( Message $message ): bool {
-		foreach ( $message->getParts() as $part ) {
-			if ( $part->getType()->isFunctionCall() ) {
-				$function_call = $part->getFunctionCall();
-				if ( $function_call instanceof FunctionCall && $this->is_ability_call( $function_call ) ) {
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-
-	private function is_ability_call( FunctionCall $call ): bool {
-		$name = $call->getName();
-		return $name !== null && str_starts_with( $name, 'wpab__' );
-	}
-
+	/**
+	 * Run one ability call: hold destructive calls for a click, otherwise hand it to core.
+	 *
+	 * @param FunctionCall $call Function call from the model.
+	 * @return FunctionResponse
+	 */
 	private function execute_ability( FunctionCall $call ): FunctionResponse {
 		$function_name = $call->getName() ?? 'unknown';
 		$function_id   = $call->getId() ?? 'unknown';
-		$ability_name  = $this->function_name_to_ability_name( $function_name );
-
-		if ( ! $ability_name ) {
-			return new FunctionResponse( $function_id, $function_name, array( 'error' => 'Not an ability function call', 'code' => 'invalid_ability_call' ) );
-		}
-
-		if ( ! function_exists( 'wp_get_ability' ) ) {
-			return new FunctionResponse( $function_id, $function_name, array( 'error' => 'Abilities API not available', 'code' => 'abilities_api_not_available' ) );
-		}
-
-		$ability = wp_get_ability( $ability_name );
-		if ( ! $ability instanceof \WP_Ability ) {
-			return new FunctionResponse( $function_id, $function_name, array( 'error' => sprintf( 'Ability "%s" not found', $ability_name ), 'code' => 'ability_not_found' ) );
-		}
+		$ability_name  = WP_AI_Client_Ability_Function_Resolver::function_name_to_ability_name( $function_name );
+		$ability       = wp_get_ability( $ability_name );
 
 		$args  = $call->getArgs();
 		$input = is_array( $args ) ? $args : array();
@@ -1069,42 +1068,44 @@ class WP_AI_Chat_Handler {
 		// Destructive abilities never run straight from the model: the user must click Confirm.
 		// Exception: edits to a draft or revision copy (not live) run right away, so the
 		// preview link already shows them. Only changes to live content wait for a click.
-		if ( self::is_destructive( $ability ) && ! self::is_unconfirmed_edit_allowed( $ability, $input ) ) {
+		if ( $ability instanceof \WP_Ability && self::is_destructive( $ability ) && ! self::is_unconfirmed_edit_allowed( $ability, $input ) ) {
 			return new FunctionResponse( $function_id, $function_name, $this->hold_for_confirmation( $ability, $input ) );
 		}
 
-		$result = $ability->execute( $input );
-
-		if ( is_wp_error( $result ) ) {
-			return new FunctionResponse( $function_id, $function_name, array(
-				'error' => $result->get_error_message(),
-				'code'  => $result->get_error_code(),
-				'data'  => $result->get_error_data(),
-			) );
+		// Core turns an empty argument list into null, which abilities without a schema
+		// default reject ("input is not of type object"). Models often send {} for
+		// parameterless calls, so run those here with an empty object instead.
+		if ( empty( $input ) && $ability instanceof \WP_Ability && in_array( $ability_name, $this->declared_abilities, true ) ) {
+			$result = $ability->execute( array() );
+			if ( is_wp_error( $result ) ) {
+				return new FunctionResponse( $function_id, $function_name, array(
+					'error' => $result->get_error_message(),
+					'code'  => $result->get_error_code(),
+					'data'  => $result->get_error_data(),
+				) );
+			}
+			// Match core's resolver: newer core shapes results to the output schema.
+			if ( function_exists( 'wp_prepare_json_value_for_client' ) ) {
+				$result = wp_prepare_json_value_for_client( $result, $ability->get_output_schema() );
+			}
+			return new FunctionResponse( $function_id, $function_name, $result );
 		}
 
-		return new FunctionResponse( $function_id, $function_name, $result );
+		// Core checks the allowed list, runs the ability and shapes the result to its output schema.
+		return $this->resolver->execute_ability( $call );
 	}
 
-	private function function_name_to_ability_name( ?string $function_name ): ?string {
-		if ( ! $function_name || ! str_starts_with( $function_name, 'wpab__' ) ) {
-			return null;
-		}
-		$without_prefix = substr( $function_name, strlen( 'wpab__' ) );
-		return str_replace( '__', '/', $without_prefix );
-	}
-
-	private function has_api_key(): bool {
-		$credentials = get_option( 'wp_ai_client_provider_credentials', array() );
-		if ( ! is_array( $credentials ) ) {
+	/**
+	 * Whether core can serve a text prompt right now (AI enabled and a provider configured).
+	 * Deterministic: no API call is made.
+	 *
+	 * @return bool
+	 */
+	public static function ai_available(): bool {
+		if ( function_exists( 'wp_supports_ai' ) && ! wp_supports_ai() ) {
 			return false;
 		}
-		foreach ( $credentials as $api_key ) {
-			if ( ! empty( $api_key ) && is_string( $api_key ) ) {
-				return true;
-			}
-		}
-		return false;
+		return wp_ai_client_prompt( 'Hello' )->is_supported_for_text_generation();
 	}
 
 	/**

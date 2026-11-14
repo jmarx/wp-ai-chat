@@ -71,16 +71,16 @@ class WP_AI_Chat {
 	 * Render Tools > AI Chat page.
 	 */
 	public function render_tools_page(): void {
-		$credentials_url = admin_url( 'options-general.php?page=wp-ai-client' );
+		$credentials_url = admin_url( 'options-connectors.php' );
 
-		if ( ! $this->has_api_key() ) {
+		if ( ! WP_AI_Chat_Handler::ai_available() ) {
 			?>
 			<div class="wrap wp-ai-chat-wrap">
 				<h1><?php esc_html_e( 'AI Chat', 'wp-ai-chat' ); ?></h1>
 				<div class="notice notice-warning">
 					<p>
 						<strong><?php esc_html_e( 'API key required', 'wp-ai-chat' ); ?></strong><br>
-						<?php esc_html_e( 'Please configure your AI API credentials to use the AI Chat.', 'wp-ai-chat' ); ?>
+						<?php esc_html_e( 'Add an AI provider API key in Settings > Connectors to use the AI Chat.', 'wp-ai-chat' ); ?>
 					</p>
 					<p>
 						<a href="<?php echo esc_url( $credentials_url ); ?>" class="button button-primary">
@@ -124,22 +124,6 @@ class WP_AI_Chat {
 			</div>
 		</div>
 		<?php
-	}
-
-	/**
-	 * Check if API key is configured (same as handler).
-	 */
-	private function has_api_key(): bool {
-		$credentials = get_option( 'wp_ai_client_provider_credentials', array() );
-		if ( ! is_array( $credentials ) ) {
-			return false;
-		}
-		foreach ( $credentials as $api_key ) {
-			if ( ! empty( $api_key ) && is_string( $api_key ) ) {
-				return true;
-			}
-		}
-		return false;
 	}
 
 	public function ajax_send(): void {

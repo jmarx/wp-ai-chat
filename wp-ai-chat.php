@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP AI Chat
  * Description: Reusable chat UI with generic AI handler. Requires WordPress 7.0+ (bundled AI Client).
- * Version: 1.2.1
+ * Version: 1.2.2
  * Author: Everorange
  * License: GPL-2.0-or-later
  * Text Domain: wp-ai-chat
@@ -14,7 +14,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'WP_AI_CHAT_VERSION', '1.2.1' );
+define( 'WP_AI_CHAT_VERSION', '1.2.2' );
 define( 'WP_AI_CHAT_PLUGIN_FILE', __FILE__ );
 define( 'WP_AI_CHAT_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 

@@ -297,11 +297,10 @@ class WP_AI_Chat_Handler {
 	}
 
 	/**
-	 * Get abilities to use from the global Abilities API.
-	 *
-	 * This reads all registered abilities via wp_get_abilities()
-	 * so anything registered by plugins like AI Experiments will be
-	 * available to this assistant.
+	 * Abilities the chat offers the model: every registered ability, except the
+	 * MCP Adapter's own gateway tools (mcp-adapter/*). Those let outside MCP clients
+	 * reach abilities; the chat already offers the abilities directly, and the
+	 * gateway tools refuse to run outside an MCP connection anyway.
 	 *
 	 * @return array<string> List of ability names (slugs).
 	 */
@@ -310,16 +309,22 @@ class WP_AI_Chat_Handler {
 			return array();
 		}
 
-		$abilities     = wp_get_abilities();
 		$ability_names = array();
-
-		foreach ( $abilities as $ability ) {
-			if ( is_object( $ability ) && method_exists( $ability, 'get_name' ) ) {
-				$ability_names[] = $ability->get_name();
+		foreach ( wp_get_abilities() as $ability ) {
+			$name = $ability->get_name();
+			if ( ! str_starts_with( $name, 'mcp-adapter/' ) ) {
+				$ability_names[] = $name;
 			}
 		}
 
-		return $ability_names;
+		/**
+		 * Filters which abilities the chat offers the model.
+		 *
+		 * @param string[] $ability_names Ability names, e.g. 'gatherpress/list-events'.
+		 */
+		$filtered = apply_filters( 'wp_ai_chat_abilities', $ability_names );
+
+		return is_array( $filtered ) ? array_values( array_filter( $filtered, 'is_string' ) ) : $ability_names;
 	}
 
 	/**
